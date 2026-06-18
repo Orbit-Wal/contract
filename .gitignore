@@ -1,0 +1,6 @@
+target/
+.soroban/
+*.wasm
+**/*.wasm
+Cargo.lock
+.DS_Store
