@@ -57,8 +57,13 @@ impl TokenWrapper {
         }
         let key = DataKey::Allowance(owner.clone(), spender.clone());
         env.storage()
-            .temporary()
+            .persistent()
             .set(&key, &Allowance { amount, expiry_ledger });
+        // Allowance carries an explicit `expiry_ledger` contract; storage TTL
+        // must never expire *before* that ledger or the allowance would vanish
+        // early through archival rather than through its own stated semantics.
+        let extend_to = expiry_ledger.saturating_sub(env.ledger().sequence());
+        env.storage().persistent().extend_ttl(&key, extend_to, extend_to);
         env.events().publish(
             (Symbol::new(&env, "approved"),),
             (owner, spender, amount, expiry_ledger),
@@ -70,7 +75,7 @@ impl TokenWrapper {
     pub fn allowance(env: Env, owner: Address, spender: Address) -> Allowance {
         let key = DataKey::Allowance(owner, spender);
         env.storage()
-            .temporary()
+            .persistent()
             .get(&key)
             .unwrap_or(Allowance { amount: 0, expiry_ledger: 0 })
     }
@@ -93,7 +98,7 @@ impl TokenWrapper {
         let key = DataKey::Allowance(from.clone(), spender.clone());
         let current: Allowance = env
             .storage()
-            .temporary()
+            .persistent()
             .get(&key)
             .unwrap_or(Allowance { amount: 0, expiry_ledger: 0 });
         if current.expiry_ledger < env.ledger().sequence() {
@@ -106,7 +111,9 @@ impl TokenWrapper {
             amount: current.amount - amount,
             expiry_ledger: current.expiry_ledger,
         };
-        env.storage().temporary().set(&key, &new_allowance);
+        env.storage().persistent().set(&key, &new_allowance);
+        let extend_to = current.expiry_ledger.saturating_sub(env.ledger().sequence());
+        env.storage().persistent().extend_ttl(&key, extend_to, extend_to);
         let token_client = token::Client::new(&env, &token_id);
         token_client.transfer(&from, &to, &amount);
         env.events().publish(
@@ -114,5 +121,146 @@ impl TokenWrapper {
             (spender, from, to, amount),
         );
         Ok(())
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use soroban_sdk::testutils::{Address as _, Ledger};
+
+    fn create_token_contract<'a>(
+        env: &Env,
+        admin: &Address,
+    ) -> (Address, token::StellarAssetClient<'a>, token::Client<'a>) {
+        let sac = env.register_stellar_asset_contract_v2(admin.clone());
+        let address = sac.address();
+        (
+            address.clone(),
+            token::StellarAssetClient::new(env, &address),
+            token::Client::new(env, &address),
+        )
+    }
+
+    fn setup() -> (Env, Address, TokenWrapperClient<'static>) {
+        let env = Env::default();
+        // transfer_from's nested token.transfer() call requires `from`'s auth,
+        // which is not the root-invocation address (`spender` is) — needs
+        // non-root auth mocking, not just mock_all_auths().
+        env.mock_all_auths_allowing_non_root_auth();
+        let id = env.register_contract(None, TokenWrapper);
+        let client = TokenWrapperClient::new(&env, &id);
+        (env, id, client)
+    }
+
+    #[test]
+    fn test_approve_and_allowance() {
+        let (env, _id, client) = setup();
+        let owner = Address::generate(&env);
+        let spender = Address::generate(&env);
+        env.ledger().with_mut(|l| l.sequence_number = 100);
+        client.approve(&owner, &spender, &1_000, &200);
+        let a = client.allowance(&owner, &spender);
+        assert_eq!(a.amount, 1_000);
+        assert_eq!(a.expiry_ledger, 200);
+    }
+
+    #[test]
+    fn test_approve_negative_amount_fails() {
+        let (env, _id, client) = setup();
+        let owner = Address::generate(&env);
+        let spender = Address::generate(&env);
+        env.ledger().with_mut(|l| l.sequence_number = 100);
+        assert_eq!(
+            client.try_approve(&owner, &spender, &-1, &200),
+            Err(Ok(WrapperError::InvalidAmount))
+        );
+    }
+
+    #[test]
+    fn test_approve_past_expiry_fails() {
+        let (env, _id, client) = setup();
+        let owner = Address::generate(&env);
+        let spender = Address::generate(&env);
+        env.ledger().with_mut(|l| l.sequence_number = 100);
+        assert_eq!(
+            client.try_approve(&owner, &spender, &1_000, &50),
+            Err(Ok(WrapperError::InvalidExpiry))
+        );
+    }
+
+    #[test]
+    fn test_transfer_from_happy_path() {
+        let (env, _id, client) = setup();
+        let admin = Address::generate(&env);
+        let owner = Address::generate(&env);
+        let spender = Address::generate(&env);
+        let to = Address::generate(&env);
+        let (token_id, token_admin, token) = create_token_contract(&env, &admin);
+        token_admin.mint(&owner, &1_000);
+
+        env.ledger().with_mut(|l| l.sequence_number = 100);
+        client.approve(&owner, &spender, &500, &200);
+        client.transfer_from(&spender, &token_id, &owner, &to, &300);
+
+        assert_eq!(token.balance(&owner), 700);
+        assert_eq!(token.balance(&to), 300);
+        let remaining = client.allowance(&owner, &spender);
+        assert_eq!(remaining.amount, 200);
+    }
+
+    #[test]
+    fn test_transfer_from_insufficient_allowance_fails() {
+        let (env, _id, client) = setup();
+        let admin = Address::generate(&env);
+        let owner = Address::generate(&env);
+        let spender = Address::generate(&env);
+        let to = Address::generate(&env);
+        let (token_id, token_admin, _token) = create_token_contract(&env, &admin);
+        token_admin.mint(&owner, &1_000);
+
+        env.ledger().with_mut(|l| l.sequence_number = 100);
+        client.approve(&owner, &spender, &100, &200);
+        assert_eq!(
+            client.try_transfer_from(&spender, &token_id, &owner, &to, &300),
+            Err(Ok(WrapperError::InsufficientAllowance))
+        );
+    }
+
+    #[test]
+    fn test_transfer_from_expired_allowance_fails() {
+        let (env, _id, client) = setup();
+        let admin = Address::generate(&env);
+        let owner = Address::generate(&env);
+        let spender = Address::generate(&env);
+        let to = Address::generate(&env);
+        let (token_id, token_admin, _token) = create_token_contract(&env, &admin);
+        token_admin.mint(&owner, &1_000);
+
+        env.ledger().with_mut(|l| l.sequence_number = 100);
+        client.approve(&owner, &spender, &500, &150);
+        env.ledger().with_mut(|l| l.sequence_number = 200);
+        assert_eq!(
+            client.try_transfer_from(&spender, &token_id, &owner, &to, &100),
+            Err(Ok(WrapperError::AllowanceExpired))
+        );
+    }
+
+    #[test]
+    fn test_transfer_from_zero_amount_fails() {
+        let (env, _id, client) = setup();
+        let admin = Address::generate(&env);
+        let owner = Address::generate(&env);
+        let spender = Address::generate(&env);
+        let to = Address::generate(&env);
+        let (token_id, _token_admin, _token) = create_token_contract(&env, &admin);
+
+        env.ledger().with_mut(|l| l.sequence_number = 100);
+        assert_eq!(
+            client.try_transfer_from(&spender, &token_id, &owner, &to, &0),
+            Err(Ok(WrapperError::InvalidAmount))
+        );
     }
 }
