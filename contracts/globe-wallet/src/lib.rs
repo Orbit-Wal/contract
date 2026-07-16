@@ -16,7 +16,7 @@
 //! Limits reset automatically on ledger-time day boundary.
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, Address, Env, String, Symbol, Vec,
+    contract, contracterror, contractimpl, contracttype, Address, BytesN, Env, String, Symbol, Vec,
 };
 
 // ── Storage Keys ──────────────────────────────────────────────────────────────
@@ -24,6 +24,7 @@ use soroban_sdk::{
 #[contracttype]
 pub enum DataKey {
     Admin,
+    PendingUpgrade,
     /// Whitelisted assets for a user wallet
     UserAssets(Address),
     /// Spend limit: (user, asset_code) → limit in stroops
@@ -51,6 +52,14 @@ pub struct SpendRecord {
     pub day: u64,
 }
 
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct UpgradeProposal {
+    pub wasm_hash: BytesN<32>,
+    pub proposed_by: Address,
+    pub ready_at: u32,
+}
+
 // ── Errors ────────────────────────────────────────────────────────────────────
 
 #[contracterror]
@@ -65,6 +74,11 @@ pub enum WalletError {
     /// Payment would exceed the daily spend limit for this asset
     SpendLimitExceeded = 7,
     NoAssetsProvided = 8,
+    UpgradeAlreadyPending = 9,
+    UpgradeNotPending = 10,
+    UpgradeNotReady = 11,
+    UpgradeHashMismatch = 12,
+    UpgradeFailed = 13,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -100,13 +114,76 @@ impl GlobeWallet {
     ///
     /// # Errors
     /// * [`WalletError::NotInitialized`] / [`WalletError::Unauthorized`]
-    pub fn transfer_admin(env: Env, current: Address, new_admin: Address) -> Result<(), WalletError> {
+    pub fn transfer_admin(
+        env: Env,
+        current: Address,
+        new_admin: Address,
+    ) -> Result<(), WalletError> {
         current.require_auth();
         Self::require_admin(&env, &current)?;
         env.storage().instance().set(&DataKey::Admin, &new_admin);
         env.events().publish(
             (Symbol::new(&env, "admin_transferred"),),
             (current, new_admin),
+        );
+        Ok(())
+    }
+
+    /// Queue an upgrade for later execution.
+    ///
+    /// The proposal is stored in contract instance storage and emitted as an
+    /// event so the upgrade is visible on-chain before any code swap occurs.
+    pub fn propose_upgrade(
+        env: Env,
+        proposer: Address,
+        wasm_hash: BytesN<32>,
+        delay_in_ledgers: u32,
+    ) -> Result<(), WalletError> {
+        proposer.require_auth();
+        Self::require_admin(&env, &proposer)?;
+        if env.storage().instance().has(&DataKey::PendingUpgrade) {
+            return Err(WalletError::UpgradeAlreadyPending);
+        }
+        let ready_at = env.ledger().sequence().saturating_add(delay_in_ledgers);
+        let proposal = UpgradeProposal {
+            wasm_hash: wasm_hash.clone(),
+            proposed_by: proposer.clone(),
+            ready_at,
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingUpgrade, &proposal);
+        env.events().publish(
+            (Symbol::new(&env, "upgrade_proposed"),),
+            (proposer, wasm_hash, ready_at),
+        );
+        Ok(())
+    }
+
+    /// Execute a previously proposed upgrade after the timelock elapses.
+    pub fn execute_upgrade(
+        env: Env,
+        executor: Address,
+        wasm_hash: BytesN<32>,
+    ) -> Result<(), WalletError> {
+        executor.require_auth();
+        Self::require_admin(&env, &executor)?;
+        let proposal: UpgradeProposal = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingUpgrade)
+            .ok_or(WalletError::UpgradeNotPending)?;
+        if proposal.wasm_hash != wasm_hash {
+            return Err(WalletError::UpgradeHashMismatch);
+        }
+        if env.ledger().sequence() < proposal.ready_at {
+            return Err(WalletError::UpgradeNotReady);
+        }
+        env.deployer().update_current_contract_wasm(&wasm_hash);
+        env.storage().instance().remove(&DataKey::PendingUpgrade);
+        env.events().publish(
+            (Symbol::new(&env, "upgrade_executed"),),
+            (executor, wasm_hash),
         );
         Ok(())
     }
@@ -135,10 +212,8 @@ impl GlobeWallet {
         env.storage()
             .persistent()
             .set(&DataKey::UserAssets(user.clone()), &assets);
-        env.events().publish(
-            (Symbol::new(&env, "asset_added"),),
-            (user, asset.code),
-        );
+        env.events()
+            .publish((Symbol::new(&env, "asset_added"),), (user, asset.code));
         Ok(())
     }
 
@@ -169,10 +244,8 @@ impl GlobeWallet {
         env.storage()
             .persistent()
             .set(&DataKey::UserAssets(user.clone()), &new_assets);
-        env.events().publish(
-            (Symbol::new(&env, "asset_removed"),),
-            (user, asset_code),
-        );
+        env.events()
+            .publish((Symbol::new(&env, "asset_removed"),), (user, asset_code));
         Ok(())
     }
 
@@ -202,9 +275,10 @@ impl GlobeWallet {
         if limit < 0 {
             return Err(WalletError::InvalidSpendLimit);
         }
-        env.storage()
-            .persistent()
-            .set(&DataKey::SpendLimit(user.clone(), asset_code.clone()), &limit);
+        env.storage().persistent().set(
+            &DataKey::SpendLimit(user.clone(), asset_code.clone()),
+            &limit,
+        );
         env.events().publish(
             (Symbol::new(&env, "spend_limit_set"),),
             (user, asset_code, limit),
@@ -252,9 +326,13 @@ impl GlobeWallet {
         if new_spent > limit {
             return Err(WalletError::SpendLimitExceeded);
         }
-        env.storage()
-            .temporary()
-            .set(&key, &SpendRecord { amount: new_spent, day });
+        env.storage().temporary().set(
+            &key,
+            &SpendRecord {
+                amount: new_spent,
+                day,
+            },
+        );
         env.events().publish(
             (Symbol::new(&env, "spend_recorded"),),
             (user, asset_code, amount, new_spent, limit),
@@ -295,7 +373,10 @@ mod tests {
     }
 
     fn xlm(env: &Env) -> AssetInfo {
-        AssetInfo { code: String::from_str(env, "XLM"), issuer: None }
+        AssetInfo {
+            code: String::from_str(env, "XLM"),
+            issuer: None,
+        }
     }
 
     fn usdc(env: &Env) -> AssetInfo {
@@ -423,6 +504,71 @@ mod tests {
         assert_eq!(
             client.try_transfer_admin(&caller, &caller),
             Err(Ok(WalletError::NotInitialized))
+        );
+    }
+
+    #[test]
+    fn test_propose_and_execute_upgrade() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register_contract(None, GlobeWallet);
+        let client = GlobeWalletClient::new(&env, &id);
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        let user = Address::generate(&env);
+        client.add_asset(&user, &xlm(&env));
+
+        let wasm_hash = BytesN::from_array(&env, &[7u8; 32]);
+        client.propose_upgrade(&admin, &wasm_hash, &1u32);
+
+        env.ledger().set_sequence_number(2);
+        client.execute_upgrade(&admin, &wasm_hash);
+
+        let assets = client.get_assets(&user);
+        assert_eq!(assets.len(), 1);
+        assert_eq!(assets.get(0).unwrap().code, String::from_str(&env, "XLM"));
+    }
+
+    #[test]
+    fn test_upgrade_requires_admin_and_ready_time() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register_contract(None, GlobeWallet);
+        let client = GlobeWalletClient::new(&env, &id);
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        let wasm_hash = BytesN::from_array(&env, &[8u8; 32]);
+        let non_admin = Address::generate(&env);
+        assert_eq!(
+            client.try_propose_upgrade(&non_admin, &wasm_hash, &0u32),
+            Err(Ok(WalletError::Unauthorized))
+        );
+
+        client.propose_upgrade(&admin, &wasm_hash, &5u32);
+        assert_eq!(
+            client.try_execute_upgrade(&admin, &wasm_hash),
+            Err(Ok(WalletError::UpgradeNotReady))
+        );
+    }
+
+    #[test]
+    fn test_upgrade_rejects_hash_mismatch() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register_contract(None, GlobeWallet);
+        let client = GlobeWalletClient::new(&env, &id);
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        let wasm_hash = BytesN::from_array(&env, &[9u8; 32]);
+        client.propose_upgrade(&admin, &wasm_hash, &0u32);
+        env.ledger().set_sequence_number(1);
+        let other_hash = BytesN::from_array(&env, &[10u8; 32]);
+        assert_eq!(
+            client.try_execute_upgrade(&admin, &other_hash),
+            Err(Ok(WalletError::UpgradeHashMismatch))
         );
     }
 }
