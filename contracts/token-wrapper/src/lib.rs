@@ -181,36 +181,35 @@ impl GlobeWallet {
     ///
     /// # Errors
     /// * [`WalletError::AssetNotFound`] — asset not registered.
-    pub fn remove_asset(env: Env, user: Address, asset_code: String) -> Result<(), WalletError> {
-        user.require_auth();
-        let assets: Vec<AssetInfo> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::UserAssets(user.clone()))
-            .unwrap_or_else(|| Vec::new(&env));
-        let mut new_assets: Vec<AssetInfo> = Vec::new(&env);
-        let mut found = false;
-        for i in 0..assets.len() {
-            let a = assets.get(i).unwrap();
-            if a.code == asset_code {
-                found = true;
-            } else {
-                new_assets.push_back(a);
-            }
-        }
-        if !found {
-            return Err(WalletError::AssetNotFound);
-        }
-        env.storage()
-            .persistent()
-            .set(&DataKey::UserAssets(user.clone()), &new_assets);
-        env.events().publish(
-            (Symbol::new(&env, "asset_removed"),),
-            (user, asset_code),
-        );
-        Ok(())
-    }
-
+    pub fn remove_asset(env: Env, user: Address, asset: AssetInfo) -> Result<(), WalletError> {  
+    user.require_auth();  
+    let assets: Vec<AssetInfo> = env  
+        .storage()  
+        .persistent()  
+        .get(&DataKey::UserAssets(user.clone()))  
+        .unwrap_or_else(|| Vec::new(&env));  
+    let mut new_assets: Vec<AssetInfo> = Vec::new(&env);  
+    let mut found = false;  
+    for i in 0..assets.len() {  
+        let a = assets.get(i).unwrap();  
+        if a.code == asset.code && a.issuer == asset.issuer {  
+            found = true;  
+        } else {  
+            new_assets.push_back(a);  
+        }  
+    }  
+    if !found {  
+        return Err(WalletError::AssetNotFound);  
+    }  
+    env.storage()  
+        .persistent()  
+        .set(&DataKey::UserAssets(user.clone()), &new_assets);  
+    env.events().publish(  
+        (Symbol::new(&env, "asset_removed"),),  
+        (user, asset.code, asset.issuer),  
+    );  
+    Ok(())  
+}
     /// Return all assets registered by a user.
     pub fn get_assets(env: Env, user: Address) -> Vec<AssetInfo> {
         env.storage()
