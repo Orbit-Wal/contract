@@ -22,6 +22,7 @@
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, Address, Env, String, Symbol, Vec,
+    TryFromVal,
 };
 
 // ── Storage Keys ──────────────────────────────────────────────────────────────
@@ -36,6 +37,12 @@ pub enum DataKey {
     SpendLimit(Address, String, String),
     /// Daily spent: (user, asset_code, issuer_key) → SpendRecord
     DailySpent(Address, String, String),
+}
+
+#[contracttype]
+pub enum LegacyDataKey {
+    SpendLimit(Address, String),
+    DailySpent(Address, String),
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -90,18 +97,28 @@ impl GlobeWallet {
             Some(addr) => addr.to_string(),
             None => String::from_str(env, "native"),
         };
-        let mut key = asset.code.clone();
-        key.push_str(&String::from_str(env, "|"));
-        key.push_str(&issuer_part);
-        key
+        let mut buf = [0u8; 128];
+        let code_len = asset.code.len() as usize;
+        asset.code.copy_into_slice(&mut buf[0..code_len]);
+        buf[code_len] = b'|';
+        let issuer_len = issuer_part.len() as usize;
+        issuer_part.copy_into_slice(&mut buf[code_len + 1 .. code_len + 1 + issuer_len]);
+        let total_len = code_len + 1 + issuer_len;
+        let slice = core::str::from_utf8(&buf[0..total_len]).unwrap();
+        String::from_str(env, slice)
     }
 
     /// Generate a unique key string from code + issuer string (for migration)
     fn asset_key_from_parts(env: &Env, code: &String, issuer_str: &String) -> String {
-        let mut key = code.clone();
-        key.push_str(&String::from_str(env, "|"));
-        key.push_str(issuer_str);
-        key
+        let mut buf = [0u8; 128];
+        let code_len = code.len() as usize;
+        code.copy_into_slice(&mut buf[0..code_len]);
+        buf[code_len] = b'|';
+        let issuer_len = issuer_str.len() as usize;
+        issuer_str.copy_into_slice(&mut buf[code_len + 1 .. code_len + 1 + issuer_len]);
+        let total_len = code_len + 1 + issuer_len;
+        let slice = core::str::from_utf8(&buf[0..total_len]).unwrap();
+        String::from_str(env, slice)
     }
 
     // ── Initialization ────────────────────────────────────────────────────────
@@ -222,11 +239,19 @@ impl GlobeWallet {
 
     /// Set a daily spend limit (in stroops) for a specific asset.
     ///
-    /// `limit = 0` removes the limit.
+    /// `limit = 0` removes the limit (unlimited).
     /// Assets are uniquely identified by (code, issuer) to prevent collisions.
+    ///
+    /// **Retroactive enforcement:** if the user has already spent more than
+    /// the proposed new limit in the current day window, the call is rejected
+    /// with `SpendLimitExceeded`. This prevents a limit-lowering from
+    /// silently granting headroom that was only valid under the old, higher
+    /// limit.
     ///
     /// # Errors
     /// * [`WalletError::InvalidSpendLimit`] — negative limit.
+    /// * [`WalletError::SpendLimitExceeded`] — current day's spend already
+    ///   exceeds the proposed limit.
     pub fn set_spend_limit(
         env: Env,
         user: Address,
@@ -238,6 +263,22 @@ impl GlobeWallet {
             return Err(WalletError::InvalidSpendLimit);
         }
         let asset_key = Self::asset_key(&env, &asset);
+        // Retroactive check: reject if today's spend already exceeds the
+        // new limit (unless the new limit is 0 = unlimited).
+        if limit != 0 {
+            let now = env.ledger().timestamp();
+            let day = now / 86400;
+            let key = DataKey::DailySpent(user.clone(), asset.code.clone(), asset_key.clone());
+            let record: SpendRecord = env
+                .storage()
+                .temporary()
+                .get(&key)
+                .unwrap_or(SpendRecord { amount: 0, day });
+            let spent_today = if record.day == day { record.amount } else { 0 };
+            if spent_today > limit {
+                return Err(WalletError::SpendLimitExceeded);
+            }
+        }
         env.storage()
             .persistent()
             .set(&DataKey::SpendLimit(user.clone(), asset.code.clone(), asset_key.clone()), &limit);
@@ -336,7 +377,7 @@ impl GlobeWallet {
         let new_asset_key = Self::asset_key(&env, &asset);
         
         // Read old limit (code-only key)
-        let old_key = DataKey::SpendLimit(user.clone(), legacy_asset_code.clone());
+        let old_key = LegacyDataKey::SpendLimit(user.clone(), legacy_asset_code.clone());
         let old_limit: i128 = env
             .storage()
             .persistent()
@@ -372,7 +413,7 @@ impl GlobeWallet {
         env.storage().persistent().remove(&old_key);
 
         // Also migrate daily spent records
-        let old_daily_key = DataKey::DailySpent(user.clone(), legacy_asset_code.clone());
+        let old_daily_key = LegacyDataKey::DailySpent(user.clone(), legacy_asset_code.clone());
         let daily_record: Option<SpendRecord> = env.storage().temporary().get(&old_daily_key);
         if let Some(record) = daily_record {
             let new_daily_key = DataKey::DailySpent(
@@ -616,6 +657,45 @@ mod tests {
         client.record_spend(&user, &asset, &i128::MAX);
     }
 
+    /// Retroactive enforcement: raise limit → spend near it → lower limit
+    /// below already-spent amount → must be rejected.
+    #[test]
+    fn test_raise_spend_then_lower_limit() {
+        let (env, _admin, client) = setup();
+        let user = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let asset = usdc(&env, Some(issuer));
+
+        // 1. Set a high limit
+        client.set_spend_limit(&user, &asset, &1_000_000_i128);
+
+        // 2. Spend close to the high limit
+        client.record_spend(&user, &asset, &900_000_i128);
+
+        // 3. Try to lower the limit below what was already spent → must fail
+        assert_eq!(
+            client.try_set_spend_limit(&user, &asset, &500_000_i128),
+            Err(Ok(WalletError::SpendLimitExceeded))
+        );
+
+        // 4. The old limit should still be in effect
+        assert_eq!(client.get_spend_limit(&user, &asset), 1_000_000);
+
+        // 5. Lowering to exactly the spent amount should succeed
+        client.set_spend_limit(&user, &asset, &900_000_i128);
+        assert_eq!(client.get_spend_limit(&user, &asset), 900_000);
+
+        // 6. Further spending is now blocked (at the exact limit)
+        assert_eq!(
+            client.try_record_spend(&user, &asset, &1_i128),
+            Err(Ok(WalletError::SpendLimitExceeded))
+        );
+
+        // 7. Removing the limit (setting to 0 = unlimited) should always work
+        client.set_spend_limit(&user, &asset, &0_i128);
+        assert_eq!(client.get_spend_limit(&user, &asset), 0);
+    }
+
     #[test]
     fn test_migration_from_legacy_key() {
         let (env, admin, client) = setup();
@@ -625,12 +705,12 @@ mod tests {
 
         // Simulate legacy state: set spend limit using old API (code-only)
         // We write directly to storage to simulate old format
-        let old_key = DataKey::SpendLimit(user.clone(), code.clone());
-        env.storage().persistent().set(&old_key, &1_000_i128);
-
-        // Also set a legacy daily spent record
-        let old_daily_key = DataKey::DailySpent(user.clone(), code.clone());
-        env.storage().temporary().set(&old_daily_key, &SpendRecord { amount: 500, day: 12345 });
+        let old_key = LegacyDataKey::SpendLimit(user.clone(), code.clone());
+        let old_daily_key = LegacyDataKey::DailySpent(user.clone(), code.clone());
+        env.as_contract(&client.address, || {
+            env.storage().persistent().set(&old_key, &1_000_i128);
+            env.storage().temporary().set(&old_daily_key, &SpendRecord { amount: 500, day: 12345 });
+        });
 
         // Now migrate
         let migrated = client.migrate_user_spend_limits(
@@ -647,13 +727,17 @@ mod tests {
         assert_eq!(client.get_spend_limit(&user, &asset), 1_000);
 
         // Old key should be gone
-        let old_value: i128 = env.storage().persistent().get(&old_key).unwrap_or(0);
+        let old_value: i128 = env.as_contract(&client.address, || {
+            env.storage().persistent().get(&old_key).unwrap_or(0)
+        });
         assert_eq!(old_value, 0);
 
         // Daily spent should be migrated
         let new_asset_key = GlobeWallet::asset_key(&env, &asset);
         let new_daily_key = DataKey::DailySpent(user.clone(), code, new_asset_key);
-        let record: SpendRecord = env.storage().temporary().get(&new_daily_key).unwrap();
+        let record: SpendRecord = env.as_contract(&client.address, || {
+            env.storage().temporary().get(&new_daily_key).unwrap()
+        });
         assert_eq!(record.amount, 500);
         assert_eq!(record.day, 12345);
     }
@@ -665,12 +749,14 @@ mod tests {
         let issuer = Address::generate(&env);
 
         // Create 3 users with legacy limits
-        let users = Vec::new(&env);
+        let mut users = Vec::new(&env);
         for _ in 0..3 {
             let user = Address::generate(&env);
             users.push_back(user.clone());
-            let old_key = DataKey::SpendLimit(user, code.clone());
-            env.storage().persistent().set(&old_key, &1_000_i128);
+            let old_key = LegacyDataKey::SpendLimit(user, code.clone());
+            env.as_contract(&client.address, || {
+                env.storage().persistent().set(&old_key, &1_000_i128);
+            });
         }
 
         // Batch migrate
@@ -699,8 +785,10 @@ mod tests {
         let issuer = Address::generate(&env);
 
         // Set legacy limit
-        let old_key = DataKey::SpendLimit(user.clone(), code.clone());
-        env.storage().persistent().set(&old_key, &1_000_i128);
+        let old_key = LegacyDataKey::SpendLimit(user.clone(), code.clone());
+        env.as_contract(&client.address, || {
+            env.storage().persistent().set(&old_key, &1_000_i128);
+        });
 
         // Set new limit already
         let asset = AssetInfo { code: code.clone(), issuer: Some(issuer.clone()) };
