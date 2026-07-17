@@ -24,6 +24,8 @@ use soroban_sdk::{
 #[contracttype]
 pub enum DataKey {
     Admin,
+    /// Pending admin candidate awaiting acceptance.
+    PendingAdmin(Address),
     PendingUpgrade,
     /// Whitelisted assets for a user wallet
     UserAssets(Address),
@@ -74,6 +76,7 @@ pub enum WalletError {
     /// Payment would exceed the daily spend limit for this asset
     SpendLimitExceeded = 7,
     NoAssetsProvided = 8,
+    NoPendingAdmin = 9,
     SpendOverflow = 9,
 }
 
@@ -106,10 +109,21 @@ impl GlobeWallet {
             .expect("not initialized")
     }
 
-    /// Transfer admin to a new address.
+    /// Legacy single-step admin transfer.
+    ///
+    /// Deprecated in favor of `propose_admin` + `accept_admin`.
     ///
     /// # Errors
     /// * [`WalletError::NotInitialized`] / [`WalletError::Unauthorized`]
+    #[deprecated(note = "Use propose_admin and accept_admin instead")]
+    pub fn transfer_admin(env: Env, current: Address, new_admin: Address) -> Result<(), WalletError> {
+        Self::propose_admin(env, current, new_admin)
+    }
+
+    /// Propose a new admin candidate.
+    ///
+    /// The current admin remains in control until the candidate accepts.
+    pub fn propose_admin(env: Env, current: Address, candidate: Address) -> Result<(), WalletError> {
     pub fn transfer_admin(
         env: Env,
         current: Address,
@@ -117,14 +131,47 @@ impl GlobeWallet {
     ) -> Result<(), WalletError> {
         current.require_auth();
         Self::require_admin(&env, &current)?;
-        env.storage().instance().set(&DataKey::Admin, &new_admin);
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingAdmin(current.clone()), &candidate);
         env.events().publish(
-            (Symbol::new(&env, "admin_transferred"),),
-            (current, new_admin),
+            (Symbol::new(&env, "admin_proposed"),),
+            (current, candidate),
         );
         Ok(())
     }
 
+    /// Accept a pending admin proposal.
+    pub fn accept_admin(env: Env, candidate: Address) -> Result<(), WalletError> {
+        candidate.require_auth();
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(WalletError::NotInitialized)?;
+        let pending: Option<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingAdmin(admin.clone()));
+        let pending = pending.ok_or(WalletError::NoPendingAdmin)?;
+        if pending != candidate {
+            return Err(WalletError::Unauthorized);
+        }
+        env.storage().instance().set(&DataKey::Admin, &candidate);
+        env.storage().instance().remove(&DataKey::PendingAdmin(admin.clone()));
+        env.events().publish(
+            (Symbol::new(&env, "admin_transferred"),),
+            (admin, candidate),
+        );
+        Ok(())
+    }
+
+    /// Cancel the current pending admin proposal.
+    pub fn cancel_admin_transfer(env: Env, current: Address) -> Result<(), WalletError> {
+        current.require_auth();
+        Self::require_admin(&env, &current)?;
+        env.storage().instance().remove(&DataKey::PendingAdmin(current.clone()));
+        env.events().publish((Symbol::new(&env, "admin_transfer_cancelled"),), current);
     /// Queue an upgrade for later execution.
     ///
     /// The proposal is stored in contract instance storage and emitted as an
@@ -506,6 +553,9 @@ mod tests {
         let (env, admin, client) = setup();
         let new_admin = Address::generate(&env);
         client.transfer_admin(&admin, &new_admin);
+        assert_eq!(client.admin(), admin);
+        client.propose_admin(&admin, &new_admin);
+        client.accept_admin(&new_admin);
         assert_eq!(client.admin(), new_admin);
     }
 
@@ -523,6 +573,36 @@ mod tests {
     }
 
     #[test]
+    fn test_propose_without_accept_keeps_admin_unchanged() {
+        let (env, admin, client) = setup();
+        let new_admin = Address::generate(&env);
+        client.propose_admin(&admin, &new_admin);
+        assert_eq!(client.admin(), admin);
+    }
+
+    #[test]
+    fn test_accept_by_wrong_address_fails() {
+        let (env, admin, client) = setup();
+        let candidate = Address::generate(&env);
+        let wrong = Address::generate(&env);
+        client.propose_admin(&admin, &candidate);
+        assert_eq!(
+            client.try_accept_admin(&wrong),
+            Err(Ok(WalletError::Unauthorized))
+        );
+        assert_eq!(client.admin(), admin);
+    }
+
+    #[test]
+    fn test_cancel_admin_transfer() {
+        let (env, admin, client) = setup();
+        let candidate = Address::generate(&env);
+        client.propose_admin(&admin, &candidate);
+        client.cancel_admin_transfer(&admin);
+        assert_eq!(client.admin(), admin);
+        assert_eq!(
+            client.try_accept_admin(&candidate),
+            Err(Ok(WalletError::NoPendingAdmin))
     fn test_propose_and_execute_upgrade() {
         let env = Env::default();
         env.mock_all_auths();
