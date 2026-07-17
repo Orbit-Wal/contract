@@ -74,11 +74,7 @@ pub enum WalletError {
     /// Payment would exceed the daily spend limit for this asset
     SpendLimitExceeded = 7,
     NoAssetsProvided = 8,
-    UpgradeAlreadyPending = 9,
-    UpgradeNotPending = 10,
-    UpgradeNotReady = 11,
-    UpgradeHashMismatch = 12,
-    UpgradeFailed = 13,
+    SpendOverflow = 9,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -322,7 +318,9 @@ impl GlobeWallet {
             .get(&key)
             .unwrap_or(SpendRecord { amount: 0, day });
         let spent_today = if record.day == day { record.amount } else { 0 };
-        let new_spent = spent_today.checked_add(amount).unwrap_or(i128::MAX);
+        let new_spent = spent_today
+            .checked_add(amount)
+            .ok_or(WalletError::SpendOverflow)?;
         if new_spent > limit {
             return Err(WalletError::SpendLimitExceeded);
         }
@@ -475,6 +473,23 @@ mod tests {
             client.try_record_spend(&user, &code, &2_i128),
             Err(Ok(WalletError::SpendLimitExceeded))
         );
+    }
+
+    #[test]
+    fn test_record_spend_overflow_does_not_poison_later_calls() {
+        let (env, _admin, client) = setup();
+        let user = Address::generate(&env);
+        let code = String::from_str(&env, "XLM");
+        client.set_spend_limit(&user, &code, &i128::MAX);
+
+        client.record_spend(&user, &code, &1_i128);
+
+        assert_eq!(
+            client.try_record_spend(&user, &code, &i128::MAX),
+            Err(Ok(WalletError::SpendOverflow))
+        );
+
+        client.record_spend(&user, &code, &1_i128);
     }
 
     #[test]
