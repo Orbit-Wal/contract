@@ -77,7 +77,12 @@ pub enum WalletError {
     SpendLimitExceeded = 7,
     NoAssetsProvided = 8,
     NoPendingAdmin = 9,
-    SpendOverflow = 9,
+    SpendOverflow = 10,
+    UpgradeAlreadyPending = 11,
+    UpgradeNotPending = 12,
+    UpgradeNotReady = 13,
+    UpgradeHashMismatch = 14,
+    UpgradeFailed = 15,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -124,11 +129,6 @@ impl GlobeWallet {
     ///
     /// The current admin remains in control until the candidate accepts.
     pub fn propose_admin(env: Env, current: Address, candidate: Address) -> Result<(), WalletError> {
-    pub fn transfer_admin(
-        env: Env,
-        current: Address,
-        new_admin: Address,
-    ) -> Result<(), WalletError> {
         current.require_auth();
         Self::require_admin(&env, &current)?;
         env.storage()
@@ -158,7 +158,9 @@ impl GlobeWallet {
             return Err(WalletError::Unauthorized);
         }
         env.storage().instance().set(&DataKey::Admin, &candidate);
-        env.storage().instance().remove(&DataKey::PendingAdmin(admin.clone()));
+        env.storage()
+            .instance()
+            .remove(&DataKey::PendingAdmin(admin.clone()));
         env.events().publish(
             (Symbol::new(&env, "admin_transferred"),),
             (admin, candidate),
@@ -170,8 +172,14 @@ impl GlobeWallet {
     pub fn cancel_admin_transfer(env: Env, current: Address) -> Result<(), WalletError> {
         current.require_auth();
         Self::require_admin(&env, &current)?;
-        env.storage().instance().remove(&DataKey::PendingAdmin(current.clone()));
-        env.events().publish((Symbol::new(&env, "admin_transfer_cancelled"),), current);
+        env.storage()
+            .instance()
+            .remove(&DataKey::PendingAdmin(current.clone()));
+        env.events()
+            .publish((Symbol::new(&env, "admin_transfer_cancelled"),), current);
+        Ok(())
+    }
+
     /// Queue an upgrade for later execution.
     ///
     /// The proposal is stored in contract instance storage and emitted as an
@@ -603,6 +611,10 @@ mod tests {
         assert_eq!(
             client.try_accept_admin(&candidate),
             Err(Ok(WalletError::NoPendingAdmin))
+        );
+    }
+
+    #[test]
     fn test_propose_and_execute_upgrade() {
         let env = Env::default();
         env.mock_all_auths();
