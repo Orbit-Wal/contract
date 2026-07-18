@@ -80,6 +80,7 @@ pub enum WalletError {
     NoAssetsProvided = 8,
     /// Migration error: legacy key not found or already migrated
     MigrationError = 9,
+    AssetLimitExceeded = 10,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -162,12 +163,16 @@ impl GlobeWallet {
 
     // ── Asset Registry ────────────────────────────────────────────────────────
 
+    /// Maximum assets a single user can whitelist.
+    pub const MAX_ASSETS: u32 = 50;
+
     /// Add an asset to a user's wallet registry.
     ///
     /// Only the user themselves (via `require_auth`) can add assets.
     ///
     /// # Errors
     /// * [`WalletError::AssetAlreadyAdded`] — asset already registered.
+    /// * [`WalletError::AssetLimitExceeded`] — user would exceed [`MAX_ASSETS`].
     pub fn add_asset(env: Env, user: Address, asset: AssetInfo) -> Result<(), WalletError> {
         user.require_auth();
         let mut assets: Vec<AssetInfo> = env
@@ -175,8 +180,9 @@ impl GlobeWallet {
             .persistent()
             .get(&DataKey::UserAssets(user.clone()))
             .unwrap_or_else(|| Vec::new(&env));
-        
-        // Check if asset already exists (match by both code AND issuer)
+        if assets.len() >= Self::MAX_ASSETS as u32 {
+            return Err(WalletError::AssetLimitExceeded);
+        }
         for i in 0..assets.len() {
             let existing = assets.get(i).unwrap();
             if existing.code == asset.code && existing.issuer == asset.issuer {
@@ -341,7 +347,37 @@ impl GlobeWallet {
         Ok(())
     }
 
-    // ── Migration Path ────────────────────────────────────────────────────────
+    // ── Asset List Migration ───────────────────────────────────────────────────
+
+    /// Admin-only: trim a user's asset list to `MAX_ASSETS` if it exceeds the bound.
+    pub fn migrate_user_assets(env: Env, admin: Address, user: Address) -> Result<u32, WalletError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        let assets: Vec<AssetInfo> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::UserAssets(user.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+        let len = assets.len();
+        if len <= Self::MAX_ASSETS {
+            return Ok(0);
+        }
+        let mut trimmed: Vec<AssetInfo> = Vec::new(&env);
+        for i in 0..Self::MAX_ASSETS {
+            trimmed.push_back(assets.get(i).unwrap());
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::UserAssets(user.clone()), &trimmed);
+        let removed = len - Self::MAX_ASSETS;
+        env.events().publish(
+            (Symbol::new(&env, "user_assets_migrated"),),
+            (user, removed),
+        );
+        Ok(removed)
+    }
+
+    // ── Spend Limit Migration Path ─────────────────────────────────────────────
 
     /// Migrate a single user's legacy spend limits from old (code-only) to new (code|issuer) format.
     ///
@@ -806,6 +842,51 @@ mod tests {
 
         // Limit should still be 2_000
         assert_eq!(client.get_spend_limit(&user, &asset), 2_000);
+    }
+
+    #[test]
+    fn test_max_assets_limit() {
+        let (env, _admin, client) = setup();
+        let user = Address::generate(&env);
+        for i in 0..GlobeWallet::MAX_ASSETS {
+            let code = String::from_str(&env, &format!("ASSET{}", i));
+            let asset = AssetInfo { code, issuer: None };
+            client.add_asset(&user, &asset);
+        }
+        let extra = AssetInfo {
+            code: String::from_str(&env, "EXTRA"),
+            issuer: None,
+        };
+        assert_eq!(
+            client.try_add_asset(&user, &extra),
+            Err(Ok(WalletError::AssetLimitExceeded))
+        );
+    }
+
+    #[test]
+    fn test_migrate_user_assets_trims_excess() {
+        let (env, admin, client) = setup();
+        let user = Address::generate(&env);
+        for i in 0..GlobeWallet::MAX_ASSETS + 5 {
+            let code = String::from_str(&env, &format!("ASSET{}", i));
+            let asset = AssetInfo { code, issuer: None };
+            client.add_asset(&user, &asset);
+        }
+        let removed = client.migrate_user_assets(&admin, &user);
+        assert_eq!(removed, 5);
+        let assets = client.get_assets(&user);
+        assert_eq!(assets.len(), GlobeWallet::MAX_ASSETS as u32);
+    }
+
+    #[test]
+    fn test_migrate_user_assets_requires_admin() {
+        let (env, _admin, client) = setup();
+        let user = Address::generate(&env);
+        let non_admin = Address::generate(&env);
+        assert_eq!(
+            client.try_migrate_user_assets(&non_admin, &user),
+            Err(Ok(WalletError::Unauthorized))
+        );
     }
 
     #[test]
