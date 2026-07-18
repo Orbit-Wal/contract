@@ -38,6 +38,18 @@ pub enum DataKey {
     DailySpent(Address, String),
 }
 
+/// `DailySpent` used to live in *temporary* storage while `SpendLimit` lives in
+/// *persistent* storage. Soroban archives temporary entries on its own TTL
+/// schedule, independent of the 86 400-second day-window logic here — if the
+/// entry got archived before the day boundary, `record_spend` would silently
+/// treat the user as having spent 0 today, letting them exceed the configured
+/// cap. `DailySpent` now lives in persistent storage (matching `SpendLimit`)
+/// and its TTL is proactively extended past the current day boundary on every
+/// write so archival can never race the day window.
+const LEDGERS_PER_DAY: u32 = 17_280; // ~86_400s / 5s average ledger close time
+const DAILY_SPENT_TTL_THRESHOLD: u32 = LEDGERS_PER_DAY;
+const DAILY_SPENT_TTL_EXTEND_TO: u32 = LEDGERS_PER_DAY * 2;
+
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 #[contracttype]
@@ -456,7 +468,7 @@ impl GlobeWallet {
         let key = DataKey::DailySpent(user.clone(), asset_code.clone());
         let record: SpendRecord = env
             .storage()
-            .temporary()
+            .persistent()
             .get(&key)
             .unwrap_or(SpendRecord { amount: 0, day });
         let spent_today = if record.day == day { record.amount } else { 0 };
@@ -466,6 +478,13 @@ impl GlobeWallet {
         if new_spent > limit {
             return Err(WalletError::SpendLimitExceeded);
         }
+        env.storage()
+            .persistent()
+            .set(&key, &SpendRecord { amount: new_spent, day });
+        env.storage().persistent().extend_ttl(
+            &key,
+            DAILY_SPENT_TTL_THRESHOLD,
+            DAILY_SPENT_TTL_EXTEND_TO,
         env.storage().temporary().set(
             &key,
             &SpendRecord {
@@ -533,6 +552,10 @@ mod tests {
     extern crate std;
 
     use super::*;
+    use soroban_sdk::{
+        testutils::{Address as _, Ledger as _},
+        Env, String,
+    };
     use soroban_sdk::{testutils::Address as _, testutils::Ledger as _, Env, String};
 
     fn make_code(env: &Env, n: u32) -> String {
@@ -736,6 +759,33 @@ mod tests {
         client.propose_admin(&admin, &new_admin);
         client.accept_admin(&new_admin);
         assert_eq!(client.admin(), new_admin);
+    }
+
+    #[test]
+    fn test_daily_spent_survives_temporary_ttl_eviction() {
+        // Regression test: DailySpent must live in *persistent* storage so an
+        // unrelated temporary-storage archival pass can never reset a user's
+        // spend counter before the real 86_400s day window elapses.
+        let (env, _admin, client) = setup();
+        let user = Address::generate(&env);
+        let code = String::from_str(&env, "XLM");
+        client.set_spend_limit(&user, &code, &1_000_000_i128);
+        client.record_spend(&user, &code, &900_000_i128);
+
+        // Simulate an eviction sweep of *temporary* storage only (persistent
+        // entries are untouched) by bumping the ledger sequence far past the
+        // test env's default temporary-entry TTL (16 ledgers) while staying
+        // well under the default persistent-entry TTL (4096 ledgers), so the
+        // contract instance itself is not archived — only DailySpent's old
+        // (temporary-storage) TTL would have expired at this point.
+        env.ledger().with_mut(|l| l.sequence_number += 3_000);
+
+        // If DailySpent were still in temporary storage this would have been
+        // archived/reset to 0 and the next 200_000 spend would wrongly succeed.
+        assert_eq!(
+            client.try_record_spend(&user, &code, &200_000_i128),
+            Err(Ok(WalletError::SpendLimitExceeded))
+        );
     }
 
     #[test]
