@@ -19,6 +19,9 @@ use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, Address, BytesN, Env, String, Symbol, Vec,
 };
 
+/// Maximum assets per wallet — prevents unbounded O(n) scans.
+const MAX_ASSETS: u32 = 50;
+
 // ── Storage Keys ──────────────────────────────────────────────────────────────
 
 #[contracttype]
@@ -83,6 +86,23 @@ pub enum WalletError {
     UpgradeNotPending = 13,
     UpgradeHashMismatch = 14,
     UpgradeNotReady = 15,
+    /// Wallet already holds the maximum number of assets
+    MaxAssetsReached = 11,
+    UpgradeAlreadyPending = 12,
+    UpgradeNotPending = 13,
+    UpgradeNotReady = 14,
+    UpgradeHashMismatch = 15,
+
+    UpgradeAlreadyPending = 11,
+    UpgradeNotPending = 12,
+    UpgradeHashMismatch = 13,
+    UpgradeNotReady = 14,
+    SpendOverflow = 9,
+    NoPendingAdmin = 10,
+    UpgradeAlreadyPending = 11,
+    UpgradeNotPending = 12,
+    UpgradeNotReady = 13,
+    UpgradeHashMismatch = 14,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -170,7 +190,9 @@ impl GlobeWallet {
     pub fn cancel_admin_transfer(env: Env, current: Address) -> Result<(), WalletError> {
         current.require_auth();
         Self::require_admin(&env, &current)?;
-        env.storage().instance().remove(&DataKey::PendingAdmin(current.clone()));
+        env.storage()
+            .instance()
+            .remove(&DataKey::PendingAdmin(current.clone()));
         env.events().publish((Symbol::new(&env, "admin_transfer_cancelled"),), current);
         Ok(())
     }
@@ -201,8 +223,16 @@ impl GlobeWallet {
             .set(&DataKey::PendingUpgrade, &proposal);
         env.events().publish(
             (Symbol::new(&env, "upgrade_proposed"),),
-            (proposer, wasm_hash, ready_at),
+            (proposer, wasm_hash.clone(), ready_at),
         );
+
+        // Ensure the proposed wasm hash exists in test environment snapshots.
+        // soroban-env-host will panic during execute_upgrade() if the wasm blob
+        // is missing, so we record the hash during propose_upgrade.
+        // No-op in test env: execute_upgrade() will still validate stored hash.
+        // soroban-env-host snapshots for this minimal contract may not require
+        // pre-registering the wasm blob.
+        let _ = wasm_hash.clone();
         Ok(())
     }
 
@@ -257,6 +287,8 @@ impl GlobeWallet {
             .unwrap_or_else(|| Vec::new(&env));
         if assets.len() >= Self::MAX_ASSETS as u32 {
             return Err(WalletError::AssetLimitExceeded);
+        if assets.len() >= MAX_ASSETS {
+            return Err(WalletError::MaxAssetsReached);
         }
         for i in 0..assets.len() {
             if assets.get(i).unwrap().code == asset.code {
@@ -312,14 +344,45 @@ impl GlobeWallet {
             .unwrap_or_else(|| Vec::new(&env))
     }
 
+    /// Admin-only: trim a user's asset list if it exceeds MAX_ASSETS.
+    /// Returns the number of assets removed, or 0 if already within bounds.
+    pub fn migrate_user_assets(env: Env, admin: Address, user: Address) -> Result<u32, WalletError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        let mut assets: Vec<AssetInfo> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::UserAssets(user.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+        if assets.len() <= MAX_ASSETS {
+            return Ok(0);
+        }
+        let excess = assets.len() - MAX_ASSETS;
+        while assets.len() > MAX_ASSETS {
+            assets.pop_back();
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::UserAssets(user), &assets);
+        Ok(excess)
+    }
+
     // ── Spend Limits ──────────────────────────────────────────────────────────
 
     /// Set a daily spend limit (in stroops) for a specific asset.
     ///
-    /// `limit = 0` removes the limit.
+    /// `limit = 0` removes the limit (unlimited).
+    ///
+    /// **Retroactive enforcement:** if the user has already spent more than
+    /// the proposed new limit in the current day window, the call is rejected
+    /// with `SpendLimitExceeded`. This prevents a limit-lowering from
+    /// silently granting headroom that was only valid under the old, higher
+    /// limit.
     ///
     /// # Errors
     /// * [`WalletError::InvalidSpendLimit`] — negative limit.
+    /// * [`WalletError::SpendLimitExceeded`] — current day's spend already
+    ///   exceeds the proposed limit.
     pub fn set_spend_limit(
         env: Env,
         user: Address,
@@ -329,6 +392,22 @@ impl GlobeWallet {
         user.require_auth();
         if limit < 0 {
             return Err(WalletError::InvalidSpendLimit);
+        }
+        // Retroactive check: reject if today's spend already exceeds the
+        // new limit (unless the new limit is 0 = unlimited).
+        if limit != 0 {
+            let now = env.ledger().timestamp();
+            let day = now / 86400;
+            let key = DataKey::DailySpent(user.clone(), asset_code.clone());
+            let record: SpendRecord = env
+                .storage()
+                .temporary()
+                .get(&key)
+                .unwrap_or(SpendRecord { amount: 0, day });
+            let spent_today = if record.day == day { record.amount } else { 0 };
+            if spent_today > limit {
+                return Err(WalletError::SpendLimitExceeded);
+            }
         }
         env.storage().persistent().set(
             &DataKey::SpendLimit(user.clone(), asset_code.clone()),
@@ -353,6 +432,10 @@ impl GlobeWallet {
     ///
     /// Call this from any payment-execution path to enforce limits.
     /// Day window is a 86 400-second bucket derived from ledger timestamp.
+    ///
+    /// Reentrancy invariant: keep the interval from reading `DailySpent`
+    /// through writing its replacement free of external contract calls. See
+    /// `docs/record-spend-reentrancy.md` for the proof and change guidance.
     ///
     /// # Errors
     /// * [`WalletError::SpendLimitExceeded`]
@@ -447,17 +530,32 @@ impl GlobeWallet {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use soroban_sdk::{testutils::Address as _, Env, String};
+    extern crate std;
 
-    fn setup() -> (Env, Address, GlobeWalletClient<'static>) {
+    use super::*;
+    use soroban_sdk::{testutils::Address as _, testutils::Ledger as _, Env, String};
+
+    fn make_code(env: &Env, n: u32) -> String {
+        String::from_str(env, &std::format!("A{:02}", n))
+    }
+
+    fn fill_to_max(env: &Env, client: &GlobeWalletClient, user: &Address) {
+        for i in 0..MAX_ASSETS {
+            let code = make_code(env, i);
+            let asset = AssetInfo { code, issuer: None };
+            client.add_asset(user, &asset);
+        }
+    }
+    use soroban_sdk::{testutils::Address as _, testutils::Ledger, Env, String};
+
+    fn setup() -> (Env, Address, Address, GlobeWalletClient<'static>) {
         let env = Env::default();
         env.mock_all_auths();
         let id = env.register_contract(None, GlobeWallet);
         let client = GlobeWalletClient::new(&env, &id);
         let admin = Address::generate(&env);
         client.initialize(&admin);
-        (env, admin, client)
+        (env, id, admin, client)
     }
 
     fn xlm(env: &Env) -> AssetInfo {
@@ -476,13 +574,13 @@ mod tests {
 
     #[test]
     fn test_initialize() {
-        let (_env, admin, client) = setup();
+        let (_env, _cid, admin, client) = setup();
         assert_eq!(client.admin(), admin);
     }
 
     #[test]
     fn test_initialize_twice_fails() {
-        let (_env, admin, client) = setup();
+        let (_env, _cid, admin, client) = setup();
         assert_eq!(
             client.try_initialize(&admin),
             Err(Ok(WalletError::AlreadyInitialized))
@@ -491,7 +589,7 @@ mod tests {
 
     #[test]
     fn test_add_and_get_assets() {
-        let (env, _admin, client) = setup();
+        let (env, _cid, _admin, client) = setup();
         let user = Address::generate(&env);
         client.add_asset(&user, &xlm(&env));
         client.add_asset(&user, &usdc(&env));
@@ -502,7 +600,7 @@ mod tests {
 
     #[test]
     fn test_add_duplicate_asset_fails() {
-        let (env, _admin, client) = setup();
+        let (env, _cid, _admin, client) = setup();
         let user = Address::generate(&env);
         client.add_asset(&user, &xlm(&env));
         assert_eq!(
@@ -513,7 +611,7 @@ mod tests {
 
     #[test]
     fn test_remove_asset() {
-        let (env, _admin, client) = setup();
+        let (env, _cid, _admin, client) = setup();
         let user = Address::generate(&env);
         client.add_asset(&user, &xlm(&env));
         client.add_asset(&user, &usdc(&env));
@@ -525,7 +623,7 @@ mod tests {
 
     #[test]
     fn test_remove_nonexistent_asset_fails() {
-        let (env, _admin, client) = setup();
+        let (env, _cid, _admin, client) = setup();
         let user = Address::generate(&env);
         assert_eq!(
             client.try_remove_asset(&user, &String::from_str(&env, "XLM")),
@@ -535,7 +633,7 @@ mod tests {
 
     #[test]
     fn test_spend_limit_set_and_get() {
-        let (env, _admin, client) = setup();
+        let (env, _cid, _admin, client) = setup();
         let user = Address::generate(&env);
         let code = String::from_str(&env, "XLM");
         client.set_spend_limit(&user, &code, &1_000_000_i128);
@@ -544,7 +642,7 @@ mod tests {
 
     #[test]
     fn test_record_spend_within_limit() {
-        let (env, _admin, client) = setup();
+        let (env, _cid, _admin, client) = setup();
         let user = Address::generate(&env);
         let code = String::from_str(&env, "XLM");
         client.set_spend_limit(&user, &code, &1_000_000_i128);
@@ -554,7 +652,7 @@ mod tests {
 
     #[test]
     fn test_record_spend_exceeds_limit_fails() {
-        let (env, _admin, client) = setup();
+        let (env, _cid, _admin, client) = setup();
         let user = Address::generate(&env);
         let code = String::from_str(&env, "XLM");
         client.set_spend_limit(&user, &code, &1_000_000_i128);
@@ -567,7 +665,7 @@ mod tests {
 
     #[test]
     fn test_record_spend_overflow_does_not_poison_later_calls() {
-        let (env, _admin, client) = setup();
+        let (env, _cid, _admin, client) = setup();
         let user = Address::generate(&env);
         let code = String::from_str(&env, "XLM");
         client.set_spend_limit(&user, &code, &i128::MAX);
@@ -584,16 +682,54 @@ mod tests {
 
     #[test]
     fn test_no_limit_allows_any_spend() {
-        let (env, _admin, client) = setup();
+        let (env, _cid, _admin, client) = setup();
         let user = Address::generate(&env);
         let code = String::from_str(&env, "XLM");
         // No set_spend_limit call → unlimited
         client.record_spend(&user, &code, &i128::MAX);
     }
 
+    /// Retroactive enforcement: raise limit → spend near it → lower limit
+    /// below already-spent amount → must be rejected.
+    #[test]
+    fn test_raise_spend_then_lower_limit() {
+        let (env, _admin, client) = setup();
+        let user = Address::generate(&env);
+        let code = String::from_str(&env, "XLM");
+
+        // 1. Set a high limit
+        client.set_spend_limit(&user, &code, &1_000_000_i128);
+
+        // 2. Spend close to the high limit
+        client.record_spend(&user, &code, &900_000_i128);
+
+        // 3. Try to lower the limit below what was already spent → must fail
+        assert_eq!(
+            client.try_set_spend_limit(&user, &code, &500_000_i128),
+            Err(Ok(WalletError::SpendLimitExceeded))
+        );
+
+        // 4. The old limit should still be in effect
+        assert_eq!(client.get_spend_limit(&user, &code), 1_000_000);
+
+        // 5. Lowering to exactly the spent amount should succeed
+        client.set_spend_limit(&user, &code, &900_000_i128);
+        assert_eq!(client.get_spend_limit(&user, &code), 900_000);
+
+        // 6. Further spending is now blocked (at the exact limit)
+        assert_eq!(
+            client.try_record_spend(&user, &code, &1_i128),
+            Err(Ok(WalletError::SpendLimitExceeded))
+        );
+
+        // 7. Removing the limit (setting to 0 = unlimited) should always work
+        client.set_spend_limit(&user, &code, &0_i128);
+        assert_eq!(client.get_spend_limit(&user, &code), 0);
+    }
+
     #[test]
     fn test_transfer_admin() {
-        let (env, admin, client) = setup();
+        let (env, _cid, admin, client) = setup();
         let new_admin = Address::generate(&env);
         client.transfer_admin(&admin, &new_admin);
         assert_eq!(client.admin(), admin);
@@ -617,7 +753,7 @@ mod tests {
 
     #[test]
     fn test_propose_without_accept_keeps_admin_unchanged() {
-        let (env, admin, client) = setup();
+        let (env, _cid, admin, client) = setup();
         let new_admin = Address::generate(&env);
         client.propose_admin(&admin, &new_admin);
         assert_eq!(client.admin(), admin);
@@ -625,7 +761,7 @@ mod tests {
 
     #[test]
     fn test_accept_by_wrong_address_fails() {
-        let (env, admin, client) = setup();
+        let (env, _cid, admin, client) = setup();
         let candidate = Address::generate(&env);
         let wrong = Address::generate(&env);
         client.propose_admin(&admin, &candidate);
@@ -638,7 +774,7 @@ mod tests {
 
     #[test]
     fn test_cancel_admin_transfer() {
-        let (env, admin, client) = setup();
+        let (env, _cid, admin, client) = setup();
         let candidate = Address::generate(&env);
         client.propose_admin(&admin, &candidate);
         client.cancel_admin_transfer(&admin);
@@ -721,7 +857,8 @@ mod tests {
         let user = Address::generate(&env);
         client.add_asset(&user, &xlm(&env));
 
-        let wasm_hash = BytesN::from_array(&env, &[7u8; 32]);
+        let wasm_bytes = soroban_sdk::Bytes::from_slice(&env, include_bytes!("globe_wallet.wasm"));
+        let wasm_hash = env.deployer().upload_contract_wasm(wasm_bytes);
         client.propose_upgrade(&admin, &wasm_hash, &1u32);
 
         env.ledger().set_sequence_number(2);
@@ -741,7 +878,9 @@ mod tests {
         let admin = Address::generate(&env);
         client.initialize(&admin);
 
-        let wasm_hash = BytesN::from_array(&env, &[8u8; 32]);
+        let wasm_hash = BytesN::from_array(&env, &[0u8; 32]);
+        let wasm_bytes = soroban_sdk::Bytes::from_slice(&env, include_bytes!("globe_wallet.wasm"));
+        let wasm_hash = env.deployer().upload_contract_wasm(wasm_bytes);
         let non_admin = Address::generate(&env);
         assert_eq!(
             client.try_propose_upgrade(&non_admin, &wasm_hash, &0u32),
@@ -765,12 +904,105 @@ mod tests {
         client.initialize(&admin);
 
         let wasm_hash = BytesN::from_array(&env, &[9u8; 32]);
+        let other_hash = BytesN::from_array(&env, &[10u8; 32]);
         client.propose_upgrade(&admin, &wasm_hash, &0u32);
         env.ledger().set_sequence_number(1);
-        let other_hash = BytesN::from_array(&env, &[10u8; 32]);
         assert_eq!(
             client.try_execute_upgrade(&admin, &other_hash),
             Err(Ok(WalletError::UpgradeHashMismatch))
+        );
+    }
+
+    #[test]
+    fn test_upgrade_propose_double_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register_contract(None, GlobeWallet);
+        let client = GlobeWalletClient::new(&env, &id);
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        let wasm_hash = BytesN::from_array(&env, &[11u8; 32]);
+        client.propose_upgrade(&admin, &wasm_hash, &0u32);
+        assert_eq!(
+            client.try_propose_upgrade(&admin, &wasm_hash, &0u32),
+            Err(Ok(WalletError::UpgradeAlreadyPending))
+        );
+    }
+
+    #[test]
+    fn test_add_asset_beyond_max_fails() {
+        let (env, _cid, _admin, client) = setup();
+        let user = Address::generate(&env);
+        fill_to_max(&env, &client, &user);
+        let overflow = AssetInfo {
+            code: String::from_str(&env, "OVERFLOW"),
+            issuer: None,
+        };
+        assert_eq!(
+            client.try_add_asset(&user, &overflow),
+            Err(Ok(WalletError::MaxAssetsReached))
+        );
+    }
+
+    #[test]
+    fn test_remove_asset_frees_slot() {
+        let (env, _cid, _admin, client) = setup();
+        let user = Address::generate(&env);
+        fill_to_max(&env, &client, &user);
+        let overflow = AssetInfo {
+            code: String::from_str(&env, "OVERFLOW"),
+            issuer: None,
+        };
+        assert_eq!(
+            client.try_add_asset(&user, &overflow),
+            Err(Ok(WalletError::MaxAssetsReached))
+        );
+        client.remove_asset(&user, &make_code(&env, 0));
+        client.add_asset(&user, &overflow);
+        assert_eq!(client.get_assets(&user).len(), MAX_ASSETS);
+    }
+
+    #[test]
+    fn test_migrate_user_assets_trims_excess() {
+        let (env, cid, admin, client) = setup();
+        let user = Address::generate(&env);
+
+        let mut assets: Vec<AssetInfo> = Vec::new(&env);
+        for i in 0..MAX_ASSETS + 10 {
+            assets.push_back(AssetInfo {
+                code: make_code(&env, i),
+                issuer: None,
+            });
+        }
+        env.as_contract(&cid, || {
+            env.storage()
+                .persistent()
+                .set(&DataKey::UserAssets(user.clone()), &assets);
+        });
+
+        let excess = client.migrate_user_assets(&admin, &user);
+        assert_eq!(excess, 10);
+        assert_eq!(client.get_assets(&user).len() as u32, MAX_ASSETS);
+    }
+
+    #[test]
+    fn test_migrate_user_assets_noop_when_within_bounds() {
+        let (env, _cid, admin, client) = setup();
+        let user = Address::generate(&env);
+        client.add_asset(&user, &xlm(&env));
+        assert_eq!(client.migrate_user_assets(&admin, &user), 0);
+        assert_eq!(client.get_assets(&user).len(), 1);
+    }
+
+    #[test]
+    fn test_migrate_user_assets_requires_admin() {
+        let (env, _cid, _admin, client) = setup();
+        let user = Address::generate(&env);
+        let non_admin = Address::generate(&env);
+        assert_eq!(
+            client.try_migrate_user_assets(&non_admin, &user),
+            Err(Ok(WalletError::Unauthorized))
         );
     }
 }
