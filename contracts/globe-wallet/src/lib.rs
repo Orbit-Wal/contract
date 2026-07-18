@@ -83,6 +83,12 @@ pub enum WalletError {
     UpgradeNotPending = 12,
     UpgradeHashMismatch = 13,
     UpgradeNotReady = 14,
+    SpendOverflow = 9,
+    NoPendingAdmin = 10,
+    UpgradeAlreadyPending = 11,
+    UpgradeNotPending = 12,
+    UpgradeNotReady = 13,
+    UpgradeHashMismatch = 14,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -378,6 +384,10 @@ impl GlobeWallet {
     ///
     /// Call this from any payment-execution path to enforce limits.
     /// Day window is a 86 400-second bucket derived from ledger timestamp.
+    ///
+    /// Reentrancy invariant: keep the interval from reading `DailySpent`
+    /// through writing its replacement free of external contract calls. See
+    /// `docs/record-spend-reentrancy.md` for the proof and change guidance.
     ///
     /// # Errors
     /// * [`WalletError::SpendLimitExceeded`]
