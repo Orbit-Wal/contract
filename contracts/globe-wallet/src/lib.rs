@@ -76,8 +76,12 @@ pub enum WalletError {
     /// Payment would exceed the daily spend limit for this asset
     SpendLimitExceeded = 7,
     NoAssetsProvided = 8,
-    NoPendingAdmin = 9,
     SpendOverflow = 9,
+    NoPendingAdmin = 10,
+    UpgradeAlreadyPending = 11,
+    UpgradeNotPending = 12,
+    UpgradeNotReady = 13,
+    UpgradeHashMismatch = 14,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -124,11 +128,6 @@ impl GlobeWallet {
     ///
     /// The current admin remains in control until the candidate accepts.
     pub fn propose_admin(env: Env, current: Address, candidate: Address) -> Result<(), WalletError> {
-    pub fn transfer_admin(
-        env: Env,
-        current: Address,
-        new_admin: Address,
-    ) -> Result<(), WalletError> {
         current.require_auth();
         Self::require_admin(&env, &current)?;
         env.storage()
@@ -172,6 +171,9 @@ impl GlobeWallet {
         Self::require_admin(&env, &current)?;
         env.storage().instance().remove(&DataKey::PendingAdmin(current.clone()));
         env.events().publish((Symbol::new(&env, "admin_transfer_cancelled"),), current);
+        Ok(())
+    }
+
     /// Queue an upgrade for later execution.
     ///
     /// The proposal is stored in contract instance storage and emitted as an
@@ -222,7 +224,7 @@ impl GlobeWallet {
         if env.ledger().sequence() < proposal.ready_at {
             return Err(WalletError::UpgradeNotReady);
         }
-        env.deployer().update_current_contract_wasm(&wasm_hash);
+        env.deployer().update_current_contract_wasm(wasm_hash.clone());
         env.storage().instance().remove(&DataKey::PendingUpgrade);
         env.events().publish(
             (Symbol::new(&env, "upgrade_executed"),),
@@ -342,6 +344,10 @@ impl GlobeWallet {
     /// Call this from any payment-execution path to enforce limits.
     /// Day window is a 86 400-second bucket derived from ledger timestamp.
     ///
+    /// Reentrancy invariant: keep the interval from reading `DailySpent`
+    /// through writing its replacement free of external contract calls. See
+    /// `docs/record-spend-reentrancy.md` for the proof and change guidance.
+    ///
     /// # Errors
     /// * [`WalletError::SpendLimitExceeded`]
     pub fn record_spend(
@@ -405,7 +411,7 @@ impl GlobeWallet {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::{testutils::Address as _, Env, String};
+    use soroban_sdk::{testutils::Address as _, testutils::Ledger, Env, String};
 
     fn setup() -> (Env, Address, GlobeWalletClient<'static>) {
         let env = Env::default();
@@ -603,6 +609,10 @@ mod tests {
         assert_eq!(
             client.try_accept_admin(&candidate),
             Err(Ok(WalletError::NoPendingAdmin))
+        );
+    }
+
+    #[test]
     fn test_propose_and_execute_upgrade() {
         let env = Env::default();
         env.mock_all_auths();
