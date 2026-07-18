@@ -1,5 +1,6 @@
 {
   "generators": {
+    "address": 2,
     "address": 3,
     "nonce": 0,
     "mux_id": 0
@@ -95,6 +96,7 @@
   ],
   "ledger": {
     "protocol_version": 26,
+    "sequence_number": 0,
     "sequence_number": 2,
     "timestamp": 0,
     "network_id": "0000000000000000000000000000000000000000000000000000000000000000",
@@ -161,6 +163,7 @@
               "val": {
                 "contract_instance": {
                   "executable": {
+                    "wasm": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
                     "wasm": "54530ced416629d9ba5a79fdb7f06baab7d43ccd0b04c2527bc858222c2433e3"
                   },
                   "storage": [

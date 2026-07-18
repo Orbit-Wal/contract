@@ -21,6 +21,7 @@
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
                 },
                 {
+                  "bytes": "0000000000000000000000000000000000000000000000000000000000000000"
                   "bytes": "54530ced416629d9ba5a79fdb7f06baab7d43ccd0b04c2527bc858222c2433e3"
                 },
                 {
@@ -103,6 +104,7 @@
                               "symbol": "wasm_hash"
                             },
                             "val": {
+                              "bytes": "0000000000000000000000000000000000000000000000000000000000000000"
                               "bytes": "54530ced416629d9ba5a79fdb7f06baab7d43ccd0b04c2527bc858222c2433e3"
                             }
                           }
