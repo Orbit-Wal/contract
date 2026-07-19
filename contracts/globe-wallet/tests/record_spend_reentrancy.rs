@@ -25,9 +25,9 @@ fn two_spends_in_one_host_invocation_accumulate() {
     let env = Env::default();
     env.mock_all_auths_allowing_non_root_auth();
 
-    let wallet_id = env.register(GlobeWallet, ());
+    let wallet_id = env.register_contract(None, GlobeWallet);
     let wallet = GlobeWalletClient::new(&env, &wallet_id);
-    let batcher_id = env.register(SameInvocationBatcher, ());
+    let batcher_id = env.register_contract(None, SameInvocationBatcher);
     let batcher = SameInvocationBatcherClient::new(&env, &batcher_id);
     let user = Address::generate(&env);
     let asset_code = String::from_str(&env, "XLM");
