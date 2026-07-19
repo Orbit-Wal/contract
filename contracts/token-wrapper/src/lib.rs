@@ -24,13 +24,12 @@ pub struct Allowance {
     pub expiry_ledger: u32,
 }
 
-#[contracterror]
-#[derive(Copy, Clone, Debug, PartialEq)]
-pub enum WrapperError {
-    AllowanceExpired = 1,
-    InsufficientAllowance = 2,
-    InvalidAmount = 3,
-    InvalidExpiry = 4,
+// Error code namespace for token-wrapper contract. Codes start at 2001.
+// Reserved range: 2001-2999 for future extensions.
+    AllowanceExpired = 2001,
+    InsufficientAllowance = 2002,
+    InvalidAmount = 2003,
+    InvalidExpiry = 2004,
 }
 
 #[contract]
