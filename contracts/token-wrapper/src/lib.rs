@@ -22,6 +22,7 @@
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, Address, Env, String, Symbol, Vec,
+    TryFromVal,
 };
 
 // ── Storage Keys ──────────────────────────────────────────────────────────────
@@ -36,6 +37,12 @@ pub enum DataKey {
     SpendLimit(Address, String, String),
     /// Daily spent: (user, asset_code, issuer_key) → SpendRecord
     DailySpent(Address, String, String),
+}
+
+#[contracttype]
+pub enum LegacyDataKey {
+    SpendLimit(Address, String),
+    DailySpent(Address, String),
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -73,6 +80,7 @@ pub enum WalletError {
     NoAssetsProvided = 8,
     /// Migration error: legacy key not found or already migrated
     MigrationError = 9,
+    AssetLimitExceeded = 10,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -90,18 +98,28 @@ impl GlobeWallet {
             Some(addr) => addr.to_string(),
             None => String::from_str(env, "native"),
         };
-        let mut key = asset.code.clone();
-        key.push_str(&String::from_str(env, "|"));
-        key.push_str(&issuer_part);
-        key
+        let mut buf = [0u8; 128];
+        let code_len = asset.code.len() as usize;
+        asset.code.copy_into_slice(&mut buf[0..code_len]);
+        buf[code_len] = b'|';
+        let issuer_len = issuer_part.len() as usize;
+        issuer_part.copy_into_slice(&mut buf[code_len + 1 .. code_len + 1 + issuer_len]);
+        let total_len = code_len + 1 + issuer_len;
+        let slice = core::str::from_utf8(&buf[0..total_len]).unwrap();
+        String::from_str(env, slice)
     }
 
     /// Generate a unique key string from code + issuer string (for migration)
     fn asset_key_from_parts(env: &Env, code: &String, issuer_str: &String) -> String {
-        let mut key = code.clone();
-        key.push_str(&String::from_str(env, "|"));
-        key.push_str(issuer_str);
-        key
+        let mut buf = [0u8; 128];
+        let code_len = code.len() as usize;
+        code.copy_into_slice(&mut buf[0..code_len]);
+        buf[code_len] = b'|';
+        let issuer_len = issuer_str.len() as usize;
+        issuer_str.copy_into_slice(&mut buf[code_len + 1 .. code_len + 1 + issuer_len]);
+        let total_len = code_len + 1 + issuer_len;
+        let slice = core::str::from_utf8(&buf[0..total_len]).unwrap();
+        String::from_str(env, slice)
     }
 
     // ── Initialization ────────────────────────────────────────────────────────
@@ -145,12 +163,16 @@ impl GlobeWallet {
 
     // ── Asset Registry ────────────────────────────────────────────────────────
 
+    /// Maximum assets a single user can whitelist.
+    pub const MAX_ASSETS: u32 = 50;
+
     /// Add an asset to a user's wallet registry.
     ///
     /// Only the user themselves (via `require_auth`) can add assets.
     ///
     /// # Errors
     /// * [`WalletError::AssetAlreadyAdded`] — asset already registered.
+    /// * [`WalletError::AssetLimitExceeded`] — user would exceed [`MAX_ASSETS`].
     pub fn add_asset(env: Env, user: Address, asset: AssetInfo) -> Result<(), WalletError> {
         user.require_auth();
         let mut assets: Vec<AssetInfo> = env
@@ -158,8 +180,9 @@ impl GlobeWallet {
             .persistent()
             .get(&DataKey::UserAssets(user.clone()))
             .unwrap_or_else(|| Vec::new(&env));
-        
-        // Check if asset already exists (match by both code AND issuer)
+        if assets.len() >= Self::MAX_ASSETS as u32 {
+            return Err(WalletError::AssetLimitExceeded);
+        }
         for i in 0..assets.len() {
             let existing = assets.get(i).unwrap();
             if existing.code == asset.code && existing.issuer == asset.issuer {
@@ -222,11 +245,19 @@ impl GlobeWallet {
 
     /// Set a daily spend limit (in stroops) for a specific asset.
     ///
-    /// `limit = 0` removes the limit.
+    /// `limit = 0` removes the limit (unlimited).
     /// Assets are uniquely identified by (code, issuer) to prevent collisions.
+    ///
+    /// **Retroactive enforcement:** if the user has already spent more than
+    /// the proposed new limit in the current day window, the call is rejected
+    /// with `SpendLimitExceeded`. This prevents a limit-lowering from
+    /// silently granting headroom that was only valid under the old, higher
+    /// limit.
     ///
     /// # Errors
     /// * [`WalletError::InvalidSpendLimit`] — negative limit.
+    /// * [`WalletError::SpendLimitExceeded`] — current day's spend already
+    ///   exceeds the proposed limit.
     pub fn set_spend_limit(
         env: Env,
         user: Address,
@@ -238,8 +269,30 @@ impl GlobeWallet {
             return Err(WalletError::InvalidSpendLimit);
         }
         let asset_key = Self::asset_key(&env, &asset);
+        // Retroactive check: reject if today's spend already exceeds the
+        // new limit (unless the new limit is 0 = unlimited).
+        if limit != 0 {
+            let now = env.ledger().timestamp();
+            let day = now / 86400;
+            let key = DataKey::DailySpent(user.clone(), asset.code.clone(), asset_key.clone());
+            let record: SpendRecord = env
+                .storage()
+                .temporary()
+                .get(&key)
+                .unwrap_or(SpendRecord { amount: 0, day });
+            let spent_today = if record.day == day { record.amount } else { 0 };
+            if spent_today > limit {
+                return Err(WalletError::SpendLimitExceeded);
+            }
+        }
         env.storage()
             .persistent()
+            .set(&key, &Allowance { amount, expiry_ledger });
+        // Allowance carries an explicit `expiry_ledger` contract; storage TTL
+        // must never expire *before* that ledger or the allowance would vanish
+        // early through archival rather than through its own stated semantics.
+        let extend_to = expiry_ledger.saturating_sub(env.ledger().sequence());
+        env.storage().persistent().extend_ttl(&key, extend_to, extend_to);
             .set(&DataKey::SpendLimit(user.clone(), asset.code.clone(), asset_key.clone()), &limit);
         env.events().publish(
             (Symbol::new(&env, "spend_limit_set"),),
@@ -253,6 +306,8 @@ impl GlobeWallet {
         let asset_key = Self::asset_key(&env, &asset);
         env.storage()
             .persistent()
+            .get(&key)
+            .unwrap_or(Allowance { amount: 0, expiry_ledger: 0 })
             .get(&DataKey::SpendLimit(user, asset.code, asset_key))
             .unwrap_or(0)
     }
@@ -282,7 +337,7 @@ impl GlobeWallet {
         let key = DataKey::DailySpent(user.clone(), asset.code.clone(), asset_key.clone());
         let record: SpendRecord = env
             .storage()
-            .temporary()
+            .persistent()
             .get(&key)
             .unwrap_or(SpendRecord { amount: 0, day });
         let spent_today = if record.day == day { record.amount } else { 0 };
@@ -300,7 +355,37 @@ impl GlobeWallet {
         Ok(())
     }
 
-    // ── Migration Path ────────────────────────────────────────────────────────
+    // ── Asset List Migration ───────────────────────────────────────────────────
+
+    /// Admin-only: trim a user's asset list to `MAX_ASSETS` if it exceeds the bound.
+    pub fn migrate_user_assets(env: Env, admin: Address, user: Address) -> Result<u32, WalletError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        let assets: Vec<AssetInfo> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::UserAssets(user.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+        let len = assets.len();
+        if len <= Self::MAX_ASSETS {
+            return Ok(0);
+        }
+        let mut trimmed: Vec<AssetInfo> = Vec::new(&env);
+        for i in 0..Self::MAX_ASSETS {
+            trimmed.push_back(assets.get(i).unwrap());
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::UserAssets(user.clone()), &trimmed);
+        let removed = len - Self::MAX_ASSETS;
+        env.events().publish(
+            (Symbol::new(&env, "user_assets_migrated"),),
+            (user, removed),
+        );
+        Ok(removed)
+    }
+
+    // ── Spend Limit Migration Path ─────────────────────────────────────────────
 
     /// Migrate a single user's legacy spend limits from old (code-only) to new (code|issuer) format.
     ///
@@ -333,10 +418,15 @@ impl GlobeWallet {
             code: legacy_asset_code.clone(),
             issuer: correct_issuer,
         };
+        env.storage().persistent().set(&key, &new_allowance);
+        let extend_to = current.expiry_ledger.saturating_sub(env.ledger().sequence());
+        env.storage().persistent().extend_ttl(&key, extend_to, extend_to);
+        let token_client = token::Client::new(&env, &token_id);
+        token_client.transfer(&from, &to, &amount);
         let new_asset_key = Self::asset_key(&env, &asset);
         
         // Read old limit (code-only key)
-        let old_key = DataKey::SpendLimit(user.clone(), legacy_asset_code.clone());
+        let old_key = LegacyDataKey::SpendLimit(user.clone(), legacy_asset_code.clone());
         let old_limit: i128 = env
             .storage()
             .persistent()
@@ -372,7 +462,7 @@ impl GlobeWallet {
         env.storage().persistent().remove(&old_key);
 
         // Also migrate daily spent records
-        let old_daily_key = DataKey::DailySpent(user.clone(), legacy_asset_code.clone());
+        let old_daily_key = LegacyDataKey::DailySpent(user.clone(), legacy_asset_code.clone());
         let daily_record: Option<SpendRecord> = env.storage().temporary().get(&old_daily_key);
         if let Some(record) = daily_record {
             let new_daily_key = DataKey::DailySpent(
@@ -451,6 +541,53 @@ impl GlobeWallet {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use soroban_sdk::testutils::{Address as _, Ledger};
+
+    fn create_token_contract<'a>(
+        env: &Env,
+        admin: &Address,
+    ) -> (Address, token::StellarAssetClient<'a>, token::Client<'a>) {
+        let sac = env.register_stellar_asset_contract_v2(admin.clone());
+        let address = sac.address();
+        (
+            address.clone(),
+            token::StellarAssetClient::new(env, &address),
+            token::Client::new(env, &address),
+        )
+    }
+
+    fn setup() -> (Env, Address, TokenWrapperClient<'static>) {
+        let env = Env::default();
+        // transfer_from's nested token.transfer() call requires `from`'s auth,
+        // which is not the root-invocation address (`spender` is) — needs
+        // non-root auth mocking, not just mock_all_auths().
+        env.mock_all_auths_allowing_non_root_auth();
+        let id = env.register_contract(None, TokenWrapper);
+        let client = TokenWrapperClient::new(&env, &id);
+        (env, id, client)
+    }
+
+    #[test]
+    fn test_approve_and_allowance() {
+        let (env, _id, client) = setup();
+        let owner = Address::generate(&env);
+        let spender = Address::generate(&env);
+        env.ledger().with_mut(|l| l.sequence_number = 100);
+        client.approve(&owner, &spender, &1_000, &200);
+        let a = client.allowance(&owner, &spender);
+        assert_eq!(a.amount, 1_000);
+        assert_eq!(a.expiry_ledger, 200);
+    }
+
+    #[test]
+    fn test_approve_negative_amount_fails() {
+        let (env, _id, client) = setup();
+        let owner = Address::generate(&env);
+        let spender = Address::generate(&env);
+        env.ledger().with_mut(|l| l.sequence_number = 100);
+        assert_eq!(
+            client.try_approve(&owner, &spender, &-1, &200),
+            Err(Ok(WrapperError::InvalidAmount))
     use soroban_sdk::{testutils::Address as _, Env, String};
 
     fn setup() -> (Env, Address, GlobeWalletClient<'static>) {
@@ -493,6 +630,14 @@ mod tests {
     }
 
     #[test]
+    fn test_approve_past_expiry_fails() {
+        let (env, _id, client) = setup();
+        let owner = Address::generate(&env);
+        let spender = Address::generate(&env);
+        env.ledger().with_mut(|l| l.sequence_number = 100);
+        assert_eq!(
+            client.try_approve(&owner, &spender, &1_000, &50),
+            Err(Ok(WrapperError::InvalidExpiry))
     fn test_add_and_get_assets() {
         let (env, _admin, client) = setup();
         let user = Address::generate(&env);
@@ -521,6 +666,40 @@ mod tests {
     }
 
     #[test]
+    fn test_transfer_from_happy_path() {
+        let (env, _id, client) = setup();
+        let admin = Address::generate(&env);
+        let owner = Address::generate(&env);
+        let spender = Address::generate(&env);
+        let to = Address::generate(&env);
+        let (token_id, token_admin, token) = create_token_contract(&env, &admin);
+        token_admin.mint(&owner, &1_000);
+
+        env.ledger().with_mut(|l| l.sequence_number = 100);
+        client.approve(&owner, &spender, &500, &200);
+        client.transfer_from(&spender, &token_id, &owner, &to, &300);
+
+        assert_eq!(token.balance(&owner), 700);
+        assert_eq!(token.balance(&to), 300);
+        let remaining = client.allowance(&owner, &spender);
+        assert_eq!(remaining.amount, 200);
+    }
+
+    #[test]
+    fn test_transfer_from_insufficient_allowance_fails() {
+        let (env, _id, client) = setup();
+        let admin = Address::generate(&env);
+        let owner = Address::generate(&env);
+        let spender = Address::generate(&env);
+        let to = Address::generate(&env);
+        let (token_id, token_admin, _token) = create_token_contract(&env, &admin);
+        token_admin.mint(&owner, &1_000);
+
+        env.ledger().with_mut(|l| l.sequence_number = 100);
+        client.approve(&owner, &spender, &100, &200);
+        assert_eq!(
+            client.try_transfer_from(&spender, &token_id, &owner, &to, &300),
+            Err(Ok(WrapperError::InsufficientAllowance))
     fn test_same_code_different_issuer_allowed() {
         let (env, _admin, client) = setup();
         let user = Address::generate(&env);
@@ -573,6 +752,37 @@ mod tests {
     }
 
     #[test]
+    fn test_transfer_from_expired_allowance_fails() {
+        let (env, _id, client) = setup();
+        let admin = Address::generate(&env);
+        let owner = Address::generate(&env);
+        let spender = Address::generate(&env);
+        let to = Address::generate(&env);
+        let (token_id, token_admin, _token) = create_token_contract(&env, &admin);
+        token_admin.mint(&owner, &1_000);
+
+        env.ledger().with_mut(|l| l.sequence_number = 100);
+        client.approve(&owner, &spender, &500, &150);
+        env.ledger().with_mut(|l| l.sequence_number = 200);
+        assert_eq!(
+            client.try_transfer_from(&spender, &token_id, &owner, &to, &100),
+            Err(Ok(WrapperError::AllowanceExpired))
+        );
+    }
+
+    #[test]
+    fn test_transfer_from_zero_amount_fails() {
+        let (env, _id, client) = setup();
+        let admin = Address::generate(&env);
+        let owner = Address::generate(&env);
+        let spender = Address::generate(&env);
+        let to = Address::generate(&env);
+        let (token_id, _token_admin, _token) = create_token_contract(&env, &admin);
+
+        env.ledger().with_mut(|l| l.sequence_number = 100);
+        assert_eq!(
+            client.try_transfer_from(&spender, &token_id, &owner, &to, &0),
+            Err(Ok(WrapperError::InvalidAmount))
     fn test_disambiguated_spend_limits() {
         let (env, _admin, client) = setup();
         let user = Address::generate(&env);
@@ -616,6 +826,45 @@ mod tests {
         client.record_spend(&user, &asset, &i128::MAX);
     }
 
+    /// Retroactive enforcement: raise limit → spend near it → lower limit
+    /// below already-spent amount → must be rejected.
+    #[test]
+    fn test_raise_spend_then_lower_limit() {
+        let (env, _admin, client) = setup();
+        let user = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let asset = usdc(&env, Some(issuer));
+
+        // 1. Set a high limit
+        client.set_spend_limit(&user, &asset, &1_000_000_i128);
+
+        // 2. Spend close to the high limit
+        client.record_spend(&user, &asset, &900_000_i128);
+
+        // 3. Try to lower the limit below what was already spent → must fail
+        assert_eq!(
+            client.try_set_spend_limit(&user, &asset, &500_000_i128),
+            Err(Ok(WalletError::SpendLimitExceeded))
+        );
+
+        // 4. The old limit should still be in effect
+        assert_eq!(client.get_spend_limit(&user, &asset), 1_000_000);
+
+        // 5. Lowering to exactly the spent amount should succeed
+        client.set_spend_limit(&user, &asset, &900_000_i128);
+        assert_eq!(client.get_spend_limit(&user, &asset), 900_000);
+
+        // 6. Further spending is now blocked (at the exact limit)
+        assert_eq!(
+            client.try_record_spend(&user, &asset, &1_i128),
+            Err(Ok(WalletError::SpendLimitExceeded))
+        );
+
+        // 7. Removing the limit (setting to 0 = unlimited) should always work
+        client.set_spend_limit(&user, &asset, &0_i128);
+        assert_eq!(client.get_spend_limit(&user, &asset), 0);
+    }
+
     #[test]
     fn test_migration_from_legacy_key() {
         let (env, admin, client) = setup();
@@ -625,12 +874,12 @@ mod tests {
 
         // Simulate legacy state: set spend limit using old API (code-only)
         // We write directly to storage to simulate old format
-        let old_key = DataKey::SpendLimit(user.clone(), code.clone());
-        env.storage().persistent().set(&old_key, &1_000_i128);
-
-        // Also set a legacy daily spent record
-        let old_daily_key = DataKey::DailySpent(user.clone(), code.clone());
-        env.storage().temporary().set(&old_daily_key, &SpendRecord { amount: 500, day: 12345 });
+        let old_key = LegacyDataKey::SpendLimit(user.clone(), code.clone());
+        let old_daily_key = LegacyDataKey::DailySpent(user.clone(), code.clone());
+        env.as_contract(&client.address, || {
+            env.storage().persistent().set(&old_key, &1_000_i128);
+            env.storage().temporary().set(&old_daily_key, &SpendRecord { amount: 500, day: 12345 });
+        });
 
         // Now migrate
         let migrated = client.migrate_user_spend_limits(
@@ -647,13 +896,17 @@ mod tests {
         assert_eq!(client.get_spend_limit(&user, &asset), 1_000);
 
         // Old key should be gone
-        let old_value: i128 = env.storage().persistent().get(&old_key).unwrap_or(0);
+        let old_value: i128 = env.as_contract(&client.address, || {
+            env.storage().persistent().get(&old_key).unwrap_or(0)
+        });
         assert_eq!(old_value, 0);
 
         // Daily spent should be migrated
         let new_asset_key = GlobeWallet::asset_key(&env, &asset);
         let new_daily_key = DataKey::DailySpent(user.clone(), code, new_asset_key);
-        let record: SpendRecord = env.storage().temporary().get(&new_daily_key).unwrap();
+        let record: SpendRecord = env.as_contract(&client.address, || {
+            env.storage().temporary().get(&new_daily_key).unwrap()
+        });
         assert_eq!(record.amount, 500);
         assert_eq!(record.day, 12345);
     }
@@ -665,12 +918,14 @@ mod tests {
         let issuer = Address::generate(&env);
 
         // Create 3 users with legacy limits
-        let users = Vec::new(&env);
+        let mut users = Vec::new(&env);
         for _ in 0..3 {
             let user = Address::generate(&env);
             users.push_back(user.clone());
-            let old_key = DataKey::SpendLimit(user, code.clone());
-            env.storage().persistent().set(&old_key, &1_000_i128);
+            let old_key = LegacyDataKey::SpendLimit(user, code.clone());
+            env.as_contract(&client.address, || {
+                env.storage().persistent().set(&old_key, &1_000_i128);
+            });
         }
 
         // Batch migrate
@@ -699,8 +954,10 @@ mod tests {
         let issuer = Address::generate(&env);
 
         // Set legacy limit
-        let old_key = DataKey::SpendLimit(user.clone(), code.clone());
-        env.storage().persistent().set(&old_key, &1_000_i128);
+        let old_key = LegacyDataKey::SpendLimit(user.clone(), code.clone());
+        env.as_contract(&client.address, || {
+            env.storage().persistent().set(&old_key, &1_000_i128);
+        });
 
         // Set new limit already
         let asset = AssetInfo { code: code.clone(), issuer: Some(issuer.clone()) };
@@ -718,6 +975,51 @@ mod tests {
 
         // Limit should still be 2_000
         assert_eq!(client.get_spend_limit(&user, &asset), 2_000);
+    }
+
+    #[test]
+    fn test_max_assets_limit() {
+        let (env, _admin, client) = setup();
+        let user = Address::generate(&env);
+        for i in 0..GlobeWallet::MAX_ASSETS {
+            let code = String::from_str(&env, &format!("ASSET{}", i));
+            let asset = AssetInfo { code, issuer: None };
+            client.add_asset(&user, &asset);
+        }
+        let extra = AssetInfo {
+            code: String::from_str(&env, "EXTRA"),
+            issuer: None,
+        };
+        assert_eq!(
+            client.try_add_asset(&user, &extra),
+            Err(Ok(WalletError::AssetLimitExceeded))
+        );
+    }
+
+    #[test]
+    fn test_migrate_user_assets_trims_excess() {
+        let (env, admin, client) = setup();
+        let user = Address::generate(&env);
+        for i in 0..GlobeWallet::MAX_ASSETS + 5 {
+            let code = String::from_str(&env, &format!("ASSET{}", i));
+            let asset = AssetInfo { code, issuer: None };
+            client.add_asset(&user, &asset);
+        }
+        let removed = client.migrate_user_assets(&admin, &user);
+        assert_eq!(removed, 5);
+        let assets = client.get_assets(&user);
+        assert_eq!(assets.len(), GlobeWallet::MAX_ASSETS as u32);
+    }
+
+    #[test]
+    fn test_migrate_user_assets_requires_admin() {
+        let (env, _admin, client) = setup();
+        let user = Address::generate(&env);
+        let non_admin = Address::generate(&env);
+        assert_eq!(
+            client.try_migrate_user_assets(&non_admin, &user),
+            Err(Ok(WalletError::Unauthorized))
+        );
     }
 
     #[test]
