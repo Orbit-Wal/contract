@@ -111,13 +111,15 @@ pub struct RecoveryProposal {
 #[contracterror]
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum WalletError {
-    AlreadyInitialized = 1,
-    NotInitialized = 2,
-    Unauthorized = 3,
-    AssetAlreadyAdded = 4,
-    AssetNotFound = 5,
-    InvalidSpendLimit = 6,
+    AlreadyInitialized = 1001,
+    NotInitialized = 1002,
+    Unauthorized = 1003,
+    AssetAlreadyAdded = 1004,
+    AssetNotFound = 1005,
+    InvalidSpendLimit = 1006,
     /// Payment would exceed the daily spend limit for this asset
+    SpendLimitExceeded = 1007,
+    NoAssetsProvided = 1008,
     SpendLimitExceeded = 7,
     NoAssetsProvided = 8,
     NoPendingAdmin = 9,
