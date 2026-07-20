@@ -6,7 +6,12 @@ members = [
 ]
 
 [workspace.dependencies]
-soroban-sdk = { version = "21.7.7", features = ["testutils"] }
+# NOTE: do not add `features = ["testutils"]` here — each contract already
+# re-adds it correctly under its own [dev-dependencies]. Enabling it on the
+# base dependency leaks std-only testutils code (rand, serde_json) into the
+# release/wasm32 build, which cannot compile it, breaking every deploy build.
+soroban-sdk = { version = "21.7.7" }
+soroban-sdk = { version = "26.1.0" }
 
 [profile.release]
 opt-level = "z"
