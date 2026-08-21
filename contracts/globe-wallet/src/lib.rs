@@ -1633,11 +1633,9 @@ mod tests {
         client.set_spend_limit(&user, &code, &100_i128);
 
         // All three timestamps below belong to bucket 1 (86400..=172799)
-        for ts in [86_400u64, 86_401, 172_799] {
-            // Reset env per iteration by re-registering is expensive;
-            // instead use the fact that the day counter resets between buckets
-            // and just verify that within the same bucket they accumulate.
-        }
+        // Reset env per iteration by re-registering is expensive;
+        // instead use the fact that the day counter resets between buckets
+        // and just verify that within the same bucket they accumulate.
 
         // Spend 50 in bucket 1
         env.ledger().with_mut(|l| l.timestamp = 86_400);
