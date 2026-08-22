@@ -3,6 +3,17 @@
 This is a real wallet handling real secret key material and real money movement.
 The bar for a merged PR here is deliberately high. Read this fully before opening one.
 
+## Opening an issue
+
+Use the structured issue templates in [`.github/ISSUE_TEMPLATE/`](.github/ISSUE_TEMPLATE/):
+
+- **[Bug report](.github/ISSUE_TEMPLATE/bug_report.yml)** — for defects in a contract, test, or build artifact.
+- **[Feature request](.github/ISSUE_TEMPLATE/feature_request.yml)** — for new capabilities, design decisions, or improvements.
+
+Both templates encode the sections described in this document (Context, Problem, Impact,
+Suggested fix, Definition of done). Fill every required field — issues with empty or
+placeholder sections will be closed without comment.
+
 ## What "done" means
 
 Every open issue has a **Definition of done** section. That list is not a

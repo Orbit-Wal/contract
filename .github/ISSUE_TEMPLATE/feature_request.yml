@@ -1,0 +1,82 @@
+name: Feature Request
+description: Propose a new capability, design decision, or improvement to a contract or workflow.
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before filing, read [CONTRIBUTING.md](../CONTRIBUTING.md) in full.
+        Every section below is **required**. Issues with empty or placeholder sections will be closed without comment.
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Context
+      description: >
+        Where does this fit in the system? Which contract, module, or workflow
+        is affected? What is the current state that motivates this change?
+      placeholder: "e.g. globe-wallet currently has no per-asset per-user spend-limit ceiling; the `set_spend_limit` function accepts any i128…"
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: >
+        What gap, risk, or friction does this address? Be specific — not "it
+        would be nice to have X" but why the absence of X is a real problem now.
+    validations:
+      required: true
+
+  - type: textarea
+    id: impact
+    attributes:
+      label: Impact
+      description: >
+        Who is affected, and what is the cost of not addressing this? Include
+        security, correctness, UX, and operational angles where relevant.
+    validations:
+      required: true
+
+  - type: textarea
+    id: suggested_fix
+    attributes:
+      label: Suggested fix
+      description: >
+        Your preferred approach. For design decisions (e.g. "decide X vs Y"),
+        state both options, the tradeoffs, and your recommendation. For
+        implementation work, sketch the change at the API or module level.
+        A write-up here is the deliverable for design-first issues — don't skip
+        straight to code if the issue is fundamentally about a decision.
+    validations:
+      required: true
+
+  - type: textarea
+    id: definition_of_done
+    attributes:
+      label: Definition of done
+      description: >
+        This list **is** the acceptance criteria — not a menu. A PR that
+        satisfies two out of three bullets is not partial credit; it is an
+        unfinished issue. List every condition that must be true for this
+        feature to be considered complete.
+      value: |
+        - [ ] Design decision documented in the PR description (if applicable)
+        - [ ] Implementation complete and matches the approach described above
+        - [ ] Tests added that cover the new behavior (specify what they assert)
+        - [ ] No regression to adjacent behavior (specify which path was re-verified)
+        - [ ] Evidence of a real run attached (test output, testnet logs, or recording)
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: >
+        Optional. What other approaches did you consider and why did you rule them out?
+        Helps reviewers understand the decision space without re-litigating settled ground.
+    validations:
+      required: false

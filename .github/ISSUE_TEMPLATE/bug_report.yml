@@ -1,0 +1,80 @@
+name: Bug Report
+description: Report a defect in a contract, test, or build artifact.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before filing, read [CONTRIBUTING.md](../CONTRIBUTING.md) in full.
+        Every section below is **required**. Issues with empty or placeholder sections will be closed without comment.
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Context
+      description: >
+        Where does this live? Which contract (`globe-wallet`, `token-wrapper`)?
+        Which function or code path? What were you trying to do when you hit this?
+      placeholder: "e.g. Calling `record_spend` on globe-wallet after a ledger timestamp roll-over…"
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: >
+        What is wrong, precisely? Not a restatement of the title — describe the
+        incorrect behavior, the error output, or the invariant that is violated.
+      placeholder: "e.g. The daily spend window does not reset; cumulative spend from the previous day bleeds into the new window…"
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+      description: Minimal steps or test snippet that reproduces the problem.
+      render: rust
+      placeholder: |
+        // paste a minimal failing test or CLI invocation here
+    validations:
+      required: true
+
+  - type: textarea
+    id: impact
+    attributes:
+      label: Impact
+      description: >
+        What breaks or becomes unsafe as a result? Be specific: which users,
+        which flows, what is the worst-case outcome?
+    validations:
+      required: true
+
+  - type: textarea
+    id: suggested_fix
+    attributes:
+      label: Suggested fix
+      description: >
+        Optional but encouraged. If you have a hypothesis about root cause or a
+        preferred approach, write it here. If you don't have one yet, leave this blank.
+    validations:
+      required: false
+
+  - type: textarea
+    id: definition_of_done
+    attributes:
+      label: Definition of done
+      description: >
+        This list **is** the acceptance criteria — not a menu. A PR that satisfies
+        two out of three bullets is not partial credit; it is an unfinished issue.
+        List every condition that must be true for this bug to be considered fixed.
+      value: |
+        - [ ] Root cause identified and documented in the PR description
+        - [ ] Fix applied and the previously-failing reproduction case now passes
+        - [ ] Test added that fails on `main` before the fix and passes after
+        - [ ] No regression to adjacent behavior (specify which path was re-verified)
+        - [ ] Evidence of a real run attached (test output, testnet logs, or recording)
+    validations:
+      required: true
