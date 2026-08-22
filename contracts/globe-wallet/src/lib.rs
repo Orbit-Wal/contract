@@ -126,8 +126,6 @@ pub enum WalletError {
     /// Payment would exceed the daily spend limit for this asset
     SpendLimitExceeded = 1007,
     NoAssetsProvided = 1008,
-    SpendLimitExceeded = 7,
-    NoAssetsProvided = 8,
     NoPendingAdmin = 9,
     SpendOverflow = 10,
     AssetLimitExceeded = 11,
