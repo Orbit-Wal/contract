@@ -17,7 +17,8 @@
 //! Limits reset automatically on ledger-time day boundary.
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, Address, BytesN, Env, String, Symbol, Vec,
+    contract, contracterror, contractimpl, contracttype, Address, BytesN, Env, Map, String, Symbol,
+    Vec,
 };
 
 /// Maximum assets per wallet — prevents unbounded O(n) scans.
@@ -44,6 +45,11 @@ pub enum DataKey {
     RecoveryConfig,
     /// The single in-flight recovery proposal, if any.
     RecoveryProposal,
+    /// Membership index for guardians, used to avoid scans on recovery calls.
+    ///
+    /// This is intentionally appended so the serialized values of existing
+    /// storage keys remain stable across contract upgrades.
+    GuardianMembership,
 }
 
 /// `DailySpent` used to live in *temporary* storage while `SpendLimit` lives in
@@ -349,14 +355,17 @@ impl GlobeWallet {
     pub fn add_guardian(env: Env, admin: Address, guardian: Address) -> Result<(), WalletError> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
-        let mut guardians = Self::guardians(env.clone());
-        for i in 0..guardians.len() {
-            if guardians.get(i).unwrap() == guardian {
-                return Err(WalletError::GuardianAlreadyAdded);
-            }
+        let mut membership = Self::guardian_membership(env.clone());
+        if membership.get(guardian.clone()).unwrap_or(false) {
+            return Err(WalletError::GuardianAlreadyAdded);
         }
+        let mut guardians = Self::guardians(env.clone());
         guardians.push_back(guardian.clone());
         env.storage().instance().set(&DataKey::Guardians, &guardians);
+        membership.set(guardian.clone(), true);
+        env.storage()
+            .instance()
+            .set(&DataKey::GuardianMembership, &membership);
         env.events()
             .publish((Symbol::new(&env, "guardian_added"),), guardian);
         Ok(())
@@ -392,6 +401,11 @@ impl GlobeWallet {
         env.storage()
             .instance()
             .set(&DataKey::Guardians, &new_guardians);
+        let mut membership = Self::guardian_membership(env.clone());
+        membership.remove(guardian.clone());
+        env.storage()
+            .instance()
+            .set(&DataKey::GuardianMembership, &membership);
         env.events()
             .publish((Symbol::new(&env, "guardian_removed"),), guardian);
         Ok(())
@@ -403,6 +417,33 @@ impl GlobeWallet {
             .instance()
             .get(&DataKey::Guardians)
             .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Return the guardian membership index. The ordered `Guardians` vector
+    /// remains the public API for enumeration; this map serves recovery-path
+    /// membership checks and duplicate detection.
+    ///
+    /// Contracts upgraded from a version before this index was added only
+    /// have the vector. Build and persist the index once on first access so
+    /// their registered guardians remain authorized after an upgrade.
+    fn guardian_membership(env: Env) -> Map<Address, bool> {
+        if let Some(membership) = env
+            .storage()
+            .instance()
+            .get(&DataKey::GuardianMembership)
+        {
+            return membership;
+        }
+
+        let guardians = Self::guardians(env.clone());
+        let mut membership = Map::new(&env);
+        for i in 0..guardians.len() {
+            membership.set(guardians.get(i).unwrap(), true);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::GuardianMembership, &membership);
+        membership
     }
 
     /// Configure (or reconfigure) the M-of-N recovery threshold and the
@@ -858,11 +899,11 @@ impl GlobeWallet {
     }
 
     fn require_guardian(env: &Env, caller: &Address) -> Result<(), WalletError> {
-        let guardians = Self::guardians(env.clone());
-        for i in 0..guardians.len() {
-            if &guardians.get(i).unwrap() == caller {
-                return Ok(());
-            }
+        if Self::guardian_membership(env.clone())
+            .get(caller.clone())
+            .unwrap_or(false)
+        {
+            return Ok(());
         }
         Err(WalletError::Unauthorized)
     }
@@ -1367,6 +1408,19 @@ mod tests {
         assert_eq!(
             client.try_remove_guardian(&admin, &guardians.get(0).unwrap()),
             Err(Ok(WalletError::NotEnoughGuardians))
+        );
+    }
+
+    #[test]
+    fn test_removed_guardian_cannot_initiate_recovery() {
+        let (env, admin, guardians, client) = setup_with_guardians(4);
+        client.set_recovery_config(&admin, &2u32, &10u32);
+        let removed = guardians.get(0).unwrap();
+        client.remove_guardian(&admin, &removed);
+
+        assert_eq!(
+            client.try_initiate_recovery(&removed, &Address::generate(&env)),
+            Err(Ok(WalletError::Unauthorized))
         );
     }
 
