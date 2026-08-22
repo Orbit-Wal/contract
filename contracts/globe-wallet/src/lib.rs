@@ -160,6 +160,8 @@ pub enum WalletError {
     RecoveryNotReady = 27,
     /// Approvals dropped below threshold since quorum was reached; timelock reset.
     RecoveryNotQuorate = 28,
+    /// Asset code and issuer configuration is invalid
+    InvalidAssetInfo = 29,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -675,6 +677,18 @@ impl GlobeWallet {
     /// * [`WalletError::AssetLimitExceeded`] — user would exceed [`MAX_ASSETS`].
     pub fn add_asset(env: Env, user: Address, asset: AssetInfo) -> Result<(), WalletError> {
         user.require_auth();
+
+        let is_native = asset.code == String::from_str(&env, "XLM");
+        if is_native {
+            if asset.issuer.is_some() {
+                return Err(WalletError::InvalidAssetInfo);
+            }
+        } else {
+            if asset.issuer.is_none() {
+                return Err(WalletError::InvalidAssetInfo);
+            }
+        }
+
         let mut assets: Vec<AssetInfo> = env
             .storage()
             .persistent()
@@ -943,7 +957,7 @@ mod tests {
     fn fill_to_max(env: &Env, client: &GlobeWalletClient, user: &Address) {
         for i in 0..MAX_ASSETS {
             let code = make_code(env, i);
-            let asset = AssetInfo { code, issuer: None };
+            let asset = AssetInfo { code, issuer: Some(Address::generate(env)) };
             client.add_asset(user, &asset);
         }
     }
@@ -1749,5 +1763,33 @@ mod tests {
         // confusing to users.
         env.ledger().with_mut(|l| l.timestamp = just_after);
         client.record_spend(&user, &code, &1_000_i128); // succeeds — new bucket
+    }
+
+    #[test]
+    fn test_native_code_with_issuer_is_contradictory_and_rejected() {
+        let (env, _cid, _admin, client) = setup();
+        let user = Address::generate(&env);
+        let bogus = AssetInfo {
+            code: String::from_str(&env, "XLM"),
+            issuer: Some(Address::generate(&env)),
+        };
+        assert_eq!(
+            client.try_add_asset(&user, &bogus),
+            Err(Ok(WalletError::InvalidAssetInfo))
+        );
+    }
+
+    #[test]
+    fn test_non_native_code_without_issuer_is_underspecified_and_rejected() {
+        let (env, _cid, _admin, client) = setup();
+        let user = Address::generate(&env);
+        let ambiguous = AssetInfo {
+            code: String::from_str(&env, "USDC"),
+            issuer: None,
+        };
+        assert_eq!(
+            client.try_add_asset(&user, &ambiguous),
+            Err(Ok(WalletError::InvalidAssetInfo))
+        );
     }
 }
