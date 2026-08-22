@@ -1262,6 +1262,23 @@ mod tests {
     }
 
     #[test]
+    fn test_propose_upgrade_requires_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register_contract(None, GlobeWallet);
+        let client = GlobeWalletClient::new(&env, &id);
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        let non_admin = Address::generate(&env);
+        let placeholder_hash = BytesN::from_array(&env, &[0u8; 32]); // no real WASM upload needed
+        assert_eq!(
+            client.try_propose_upgrade(&non_admin, &placeholder_hash, &0u32),
+            Err(Ok(WalletError::Unauthorized))
+        );
+    }
+
+    #[test]
     #[ignore = "embedded .wasm uses reference-types; incompatible with soroban-env-host-21.2.1 test runner"]
     fn test_upgrade_requires_admin_and_ready_time() {
         let env = Env::default();
@@ -1271,14 +1288,8 @@ mod tests {
         let admin = Address::generate(&env);
         client.initialize(&admin);
 
-        let wasm_hash = BytesN::from_array(&env, &[0u8; 32]);
         let wasm_bytes = soroban_sdk::Bytes::from_slice(&env, include_bytes!("globe_wallet.wasm"));
         let wasm_hash = env.deployer().upload_contract_wasm(wasm_bytes);
-        let non_admin = Address::generate(&env);
-        assert_eq!(
-            client.try_propose_upgrade(&non_admin, &wasm_hash, &0u32),
-            Err(Ok(WalletError::Unauthorized))
-        );
 
         client.propose_upgrade(&admin, &wasm_hash, &5u32);
         assert_eq!(
