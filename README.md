@@ -82,6 +82,10 @@ Provides `approve` / `allowance` / `transfer_from` semantics on top of the
 Soroban token interface, enabling the globe-wallet contract to move tokens
 on behalf of users within a session allowance.
 
+> **Important:** `approve` uses **overwrite** semantics — calling it again
+> for the same `(owner, spender)` pair **replaces** the previous allowance
+> rather than adding to it. See the function's doc comment for details.
+
 ## Events
 
 | Contract | Topic | Data |
