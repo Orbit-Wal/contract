@@ -288,16 +288,8 @@ impl GlobeWallet {
             .set(&DataKey::PendingUpgrade, &proposal);
         env.events().publish(
             (Symbol::new(&env, "upgrade_proposed"),),
-            (proposer, wasm_hash.clone(), ready_at),
+            (proposer, wasm_hash, ready_at),
         );
-
-        // Ensure the proposed wasm hash exists in test environment snapshots.
-        // soroban-env-host will panic during execute_upgrade() if the wasm blob
-        // is missing, so we record the hash during propose_upgrade.
-        // No-op in test env: execute_upgrade() will still validate stored hash.
-        // soroban-env-host snapshots for this minimal contract may not require
-        // pre-registering the wasm blob.
-        let _ = wasm_hash.clone();
         Ok(())
     }
 
