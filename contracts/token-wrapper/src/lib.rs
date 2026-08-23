@@ -48,6 +48,13 @@ pub struct TokenWrapper;
 impl TokenWrapper {
     /// Grant a spender allowance over the caller's tokens.
     ///
+    /// **Overwrite semantics:** calling `approve` for an existing
+    /// `(owner, spender)` pair **replaces** the previous allowance
+    /// wholesale — it does **not** add to the remaining balance.
+    /// If a spender has already used part of their allowance and
+    /// the owner calls `approve` again, the new `amount` becomes the
+    /// *total* allowance, not an increment on top of what's left.
+    ///
     /// `expiry_ledger` must be in the future.
     pub fn approve(
         env: Env,
@@ -194,6 +201,30 @@ mod tests {
             client.try_approve(&owner, &spender, &1_000, &50),
             Err(Ok(WrapperError::InvalidExpiry))
         );
+    }
+
+    #[test]
+    fn test_approve_overwrites_previous_allowance() {
+        let (env, _id, client) = setup();
+        let admin = Address::generate(&env);
+        let owner = Address::generate(&env);
+        let spender = Address::generate(&env);
+        let to = Address::generate(&env);
+        let (token_id, token_admin, _token) = create_token_contract(&env, &admin);
+        token_admin.mint(&owner, &1_000);
+
+        // Grant 500 allowance and spend 300, leaving 200 remaining.
+        env.ledger().with_mut(|l| l.sequence_number = 100);
+        client.approve(&owner, &spender, &500, &300);
+        client.transfer_from(&spender, &token_id, &owner, &to, &300);
+        let remaining = client.allowance(&owner, &spender);
+        assert_eq!(remaining.amount, 200);
+
+        // Calling approve again replaces (not adds to) the allowance.
+        client.approve(&owner, &spender, &500, &400);
+        let a = client.allowance(&owner, &spender);
+        assert_eq!(a.amount, 500); // NOT 700 — overwrite, not additive
+        assert_eq!(a.expiry_ledger, 400);
     }
 
     #[test]
