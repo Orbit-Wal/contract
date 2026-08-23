@@ -173,6 +173,17 @@ mod tests {
     }
 
     #[test]
+    fn test_allowance_unset_pair_returns_zero() {
+        let (env, _id, client) = setup();
+        let owner = Address::generate(&env);
+        let spender = Address::generate(&env);
+        // Cold read: never approved — hits unwrap_or default branch.
+        let a = client.allowance(&owner, &spender);
+        assert_eq!(a.amount, 0);
+        assert_eq!(a.expiry_ledger, 0);
+    }
+
+    #[test]
     fn test_approve_negative_amount_fails() {
         let (env, _id, client) = setup();
         let owner = Address::generate(&env);
