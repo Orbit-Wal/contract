@@ -75,6 +75,9 @@ record_spend(env, user, asset_code, amount) -> Result<()>
 - `record_spend` is called from any payment path; rejects with `SpendLimitExceeded` if
   cumulative daily spend would exceed the limit.
 - Day window resets automatically — no manual reset required.
+- Spend limits are enforced **within globe-wallet only**. Transfers routed
+  directly through token-wrapper bypass the daily cap unless the integrator
+  calls `record_spend` first. See [docs/design/architecture.md](docs/design/architecture.md).
 
 ## Contract: `token-wrapper`
 
@@ -85,6 +88,10 @@ on behalf of users within a session allowance.
 > **Important:** `approve` uses **overwrite** semantics — calling it again
 > for the same `(owner, spender)` pair **replaces** the previous allowance
 > rather than adding to it. See the function's doc comment for details.
+>
+> See **[docs/design/architecture.md](docs/design/architecture.md)** for how
+> globe-wallet and token-wrapper are intended to compose, the current state
+> of their interaction, and integration guidance.
 
 ## Events
 
