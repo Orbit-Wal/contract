@@ -886,10 +886,17 @@ impl GlobeWallet {
 
     // ── Migration ───────────────────────────────────────────────────────────────
 
-    /// Admin-only: trim a user's asset list to `MAX_ASSETS` if it exceeds the bound.
+    /// Admin and user: trim a user's asset list to `MAX_ASSETS` if it exceeds the bound.
     /// Returns the number of assets trimmed (0 if already within limit).
+    ///
+    /// # Authorization Decision
+    /// Dual authorization is required: `admin.require_auth()` ensures only an
+    /// administrator can initiate a migration, while `user.require_auth()`
+    /// preserves the self-sovereign property of the wallet by ensuring the
+    /// user consents to the exact asset list modification taking place.
     pub fn migrate_user_assets(env: Env, admin: Address, user: Address) -> Result<u32, WalletError> {
         admin.require_auth();
+        user.require_auth();
         Self::require_admin(&env, &admin)?;
         let assets: Vec<AssetInfo> = env
             .storage()
@@ -903,6 +910,11 @@ impl GlobeWallet {
         let mut trimmed: Vec<AssetInfo> = Vec::new(&env);
         for i in 0..Self::MAX_ASSETS {
             trimmed.push_back(assets.get(i).unwrap());
+        }
+        for i in Self::MAX_ASSETS..len {
+            let dropped = assets.get(i).unwrap();
+            env.storage().persistent().remove(&DataKey::SpendLimit(user.clone(), dropped.code.clone()));
+            env.storage().persistent().remove(&DataKey::DailySpent(user.clone(), dropped.code.clone()));
         }
         env.storage()
             .persistent()
@@ -1274,17 +1286,40 @@ mod tests {
         let mut assets: Vec<AssetInfo> = Vec::new(&env);
         for i in 0..GlobeWallet::MAX_ASSETS + 10 {
             let code = String::from_str(&env, &std::format!("ASSET{}", i));
-            assets.push_back(AssetInfo { code, issuer: None });
+            assets.push_back(AssetInfo { code: code.clone(), issuer: None });
         }
         env.as_contract(&cid, || {
             env.storage()
                 .persistent()
                 .set(&DataKey::UserAssets(user.clone()), &assets);
+                
+            // Set up some spend limits and daily spent records for all assets
+            for i in 0..GlobeWallet::MAX_ASSETS + 10 {
+                let code = String::from_str(&env, &std::format!("ASSET{}", i));
+                env.storage().persistent().set(&DataKey::SpendLimit(user.clone(), code.clone()), &1000_i128);
+                env.storage().persistent().set(&DataKey::DailySpent(user.clone(), code.clone()), &SpendRecord { amount: 500, day: 0 });
+            }
         });
         let removed = client.migrate_user_assets(&admin, &user);
         assert_eq!(removed, 10);
         let assets = client.get_assets(&user);
         assert_eq!(assets.len(), GlobeWallet::MAX_ASSETS as u32);
+        
+        env.as_contract(&cid, || {
+            // Verify that dropped assets' storage keys are removed
+            for i in GlobeWallet::MAX_ASSETS..GlobeWallet::MAX_ASSETS + 10 {
+                let code = String::from_str(&env, &std::format!("ASSET{}", i));
+                assert!(!env.storage().persistent().has(&DataKey::SpendLimit(user.clone(), code.clone())));
+                assert!(!env.storage().persistent().has(&DataKey::DailySpent(user.clone(), code.clone())));
+            }
+            
+            // Verify that kept assets' storage keys are intact
+            for i in 0..GlobeWallet::MAX_ASSETS {
+                let code = String::from_str(&env, &std::format!("ASSET{}", i));
+                assert!(env.storage().persistent().has(&DataKey::SpendLimit(user.clone(), code.clone())));
+                assert!(env.storage().persistent().has(&DataKey::DailySpent(user.clone(), code.clone())));
+            }
+        });
     }
 
     #[test]
