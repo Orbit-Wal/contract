@@ -10,6 +10,8 @@ members = [
 # re-adds it correctly under its own [dev-dependencies]. Enabling it on the
 # base dependency leaks std-only testutils code (rand, serde_json) into the
 # release/wasm32 build, which cannot compile it, breaking every deploy build.
+# Pin to 21.7.7 is currently unreviewed drift. Not yet evaluated for upgrade to 27.x.
+# Requires careful migration testing due to protocol coupling and security-relevant fixes.
 soroban-sdk = { version = "21.7.7" }
 
 [profile.release]
