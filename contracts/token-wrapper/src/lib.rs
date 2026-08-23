@@ -91,6 +91,7 @@ impl TokenWrapper {
     /// Transfer tokens from `from` to `to` using a previously granted allowance.
     ///
     /// Decrements the allowance; fails if expired or insufficient.
+    /// An allowance is usable through and including its `expiry_ledger`.
     pub fn transfer_from(
         env: Env,
         spender: Address,
@@ -267,5 +268,20 @@ mod tests {
             client.try_transfer_from(&spender, &token_id, &owner, &to, &0),
             Err(Ok(WrapperError::InvalidAmount))
         );
+    }
+
+    #[test]
+    fn test_transfer_from_succeeds_exactly_at_expiry_ledger() {
+        let (env, _id, client) = setup();
+        let admin = Address::generate(&env);
+        let owner = Address::generate(&env);
+        let spender = Address::generate(&env);
+        let to = Address::generate(&env);
+        let (token_id, token_admin, _token) = create_token_contract(&env, &admin);
+        token_admin.mint(&owner, &1_000);
+        env.ledger().with_mut(|l| l.sequence_number = 100);
+        client.approve(&owner, &spender, &500, &200);
+        env.ledger().with_mut(|l| l.sequence_number = 200); // exactly at expiry_ledger
+        client.transfer_from(&spender, &token_id, &owner, &to, &100); // currently succeeds — lock this in explicitly
     }
 }
