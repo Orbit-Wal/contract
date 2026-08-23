@@ -64,6 +64,18 @@ const LEDGERS_PER_DAY: u32 = 17_280; // ~86_400s / 5s average ledger close time
 const DAILY_SPENT_TTL_THRESHOLD: u32 = LEDGERS_PER_DAY;
 const DAILY_SPENT_TTL_EXTEND_TO: u32 = LEDGERS_PER_DAY * 2;
 
+/// `UserAssets` and `SpendLimit` are persistent entries without a natural
+/// time-based expiry (unlike `DailySpent`'s 86 400-second day window).
+/// Without proactive TTL extension, a wallet that goes quiet for long
+/// periods while the contract itself stays active could have its asset
+/// list or spend limits archived, requiring a separate (costly) restore
+/// operation before the entry is readable again. Extending to ~30 days of
+/// ledgers on every write keeps these entries alive for any reasonable
+/// inactivity window while staying well within Soroban's max_entry_ttl
+/// (~6.3M ledgers, ≈1 year).
+const PERSISTENT_TTL_THRESHOLD: u32 = LEDGERS_PER_DAY * 7; // ~7 days
+const PERSISTENT_TTL_EXTEND_TO: u32 = LEDGERS_PER_DAY * 30; // ~30 days
+
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 #[contracttype]
@@ -126,8 +138,6 @@ pub enum WalletError {
     /// Payment would exceed the daily spend limit for this asset
     SpendLimitExceeded = 1007,
     NoAssetsProvided = 1008,
-    SpendLimitExceeded = 7,
-    NoAssetsProvided = 8,
     NoPendingAdmin = 9,
     SpendOverflow = 10,
     AssetLimitExceeded = 11,
@@ -304,15 +314,8 @@ impl GlobeWallet {
             .set(&DataKey::PendingUpgrade, &proposal);
         env.events().publish(
             (Symbol::new(&env, "upgrade_proposed"),),
-            (proposer, wasm_hash.clone(), ready_at),
+            (proposer, wasm_hash, ready_at),
         );
-
-        // No pre-check of wasm_hash is performed here; validation deferred to
-        // execute_upgrade so that propose_upgrade completes quickly. Any
-        // validation failure signal (e.g., UpgradeWasmNotUploaded) occurs after
-        // the timelock has elapsed, at which point the admin can retry or abort
-        // the upgrade without losing the delay window.
-        let _ = wasm_hash.clone();
         Ok(())
     }
 
@@ -762,6 +765,11 @@ impl GlobeWallet {
         env.storage()
             .persistent()
             .set(&DataKey::UserAssets(user.clone()), &assets);
+        env.storage().persistent().extend_ttl(
+            &DataKey::UserAssets(user.clone()),
+            PERSISTENT_TTL_THRESHOLD,
+            PERSISTENT_TTL_EXTEND_TO,
+        );
         env.events()
             .publish((Symbol::new(&env, "asset_added"),), (user, asset.code));
         Ok(())
@@ -794,6 +802,11 @@ impl GlobeWallet {
         env.storage()
             .persistent()
             .set(&DataKey::UserAssets(user.clone()), &new_assets);
+        env.storage().persistent().extend_ttl(
+            &DataKey::UserAssets(user.clone()),
+            PERSISTENT_TTL_THRESHOLD,
+            PERSISTENT_TTL_EXTEND_TO,
+        );
         env.events()
             .publish((Symbol::new(&env, "asset_removed"),), (user, asset_code));
         Ok(())
@@ -854,6 +867,11 @@ impl GlobeWallet {
         env.storage().persistent().set(
             &DataKey::SpendLimit(user.clone(), asset_code.clone()),
             &limit,
+        );
+        env.storage().persistent().extend_ttl(
+            &DataKey::SpendLimit(user.clone(), asset_code.clone()),
+            PERSISTENT_TTL_THRESHOLD,
+            PERSISTENT_TTL_EXTEND_TO,
         );
         env.events().publish(
             (Symbol::new(&env, "spend_limit_set"),),
@@ -946,6 +964,11 @@ impl GlobeWallet {
         env.storage()
             .persistent()
             .set(&DataKey::UserAssets(user.clone()), &trimmed);
+        env.storage().persistent().extend_ttl(
+            &DataKey::UserAssets(user.clone()),
+            PERSISTENT_TTL_THRESHOLD,
+            PERSISTENT_TTL_EXTEND_TO,
+        );
         let removed = len - Self::MAX_ASSETS;
         env.events().publish(
             (Symbol::new(&env, "user_assets_migrated"),),
@@ -1905,5 +1928,42 @@ mod tests {
             client.try_add_asset(&user, &ambiguous),
             Err(Ok(WalletError::InvalidAssetInfo))
         );
+    }
+
+    // ── TTL Extension ───────────────────────────────────────────────────
+    //
+    // Proactive extend_ttl on every write keeps UserAssets and SpendLimit
+    // entries alive past the default persistent-entry TTL (4096 ledgers
+    // in test env). Without it, a wallet that goes quiet while the
+    // contract stays active could have its entries archived.
+
+    #[test]
+    fn test_user_assets_ttl_extension_after_long_idle_period() {
+        let (env, _cid, _admin, client) = setup();
+        let user = Address::generate(&env);
+        client.add_asset(&user, &xlm(&env));
+        client.add_asset(&user, &usdc(&env));
+
+        // Jump well past the default persistent-entry TTL (4096 ledgers).
+        // Without extend_ttl, the entry's default TTL would have expired
+        // and the archived entry would not be readable without a restore.
+        env.ledger().with_mut(|l| l.sequence_number += 50_000);
+
+        let assets = client.get_assets(&user);
+        assert_eq!(assets.len(), 2);
+        assert_eq!(assets.get(0).unwrap().code, String::from_str(&env, "XLM"));
+    }
+
+    #[test]
+    fn test_spend_limit_ttl_extension_after_long_idle_period() {
+        let (env, _cid, _admin, client) = setup();
+        let user = Address::generate(&env);
+        let code = String::from_str(&env, "XLM");
+        client.set_spend_limit(&user, &code, &1_000_000_i128);
+
+        // Jump well past default persistent-entry TTL.
+        env.ledger().with_mut(|l| l.sequence_number += 50_000);
+
+        assert_eq!(client.get_spend_limit(&user, &code), 1_000_000);
     }
 }
