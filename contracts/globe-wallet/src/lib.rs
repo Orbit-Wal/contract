@@ -434,6 +434,21 @@ impl GlobeWallet {
 
     /// Remove a guardian. Admin-authorized.
     ///
+    /// If a recovery proposal is currently pending and the removed guardian
+    /// had already approved it, that approval is stripped from the proposal
+    /// as part of this same call (design decision (a) from issue #26, chosen
+    /// over documenting the removal as approval-preserving): an admin who
+    /// removes a guardian because they no longer trust that guardian's key
+    /// must not have a since-revoked guardian's vote still able to push a
+    /// recovery to quorum and completion. If stripping the approval drops
+    /// the proposal back below `RecoveryConfig.threshold`, `ready_at` is
+    /// cleared exactly as `revoke_recovery_approval` already does on its own
+    /// below-threshold path, so the timelock has to be re-armed by a fresh
+    /// round of approvals rather than silently keeping a stale countdown
+    /// alive on a now-under-quorum proposal. This mutation cannot itself
+    /// fail: it can only ever remove an entry from a `Vec`/clear an
+    /// `Option`, neither of which has a fallible precondition.
+    ///
     /// # Errors
     /// * [`WalletError::NotEnoughGuardians`] — would drop the guardian count
     ///   below the configured recovery threshold.
@@ -454,7 +469,8 @@ impl GlobeWallet {
         if !found {
             return Err(WalletError::GuardianNotFound);
         }
-        if let Some(config) = Self::recovery_config(env.clone()) {
+        let recovery_config = Self::recovery_config(env.clone());
+        if let Some(config) = &recovery_config {
             if new_guardians.len() < config.threshold {
                 return Err(WalletError::NotEnoughGuardians);
             }
@@ -467,6 +483,39 @@ impl GlobeWallet {
         env.storage()
             .instance()
             .set(&DataKey::GuardianMembership, &membership);
+
+        // Strip a stale approval from any pending recovery proposal so a
+        // just-removed guardian's earlier vote can no longer count toward
+        // quorum. See the doc comment above and issue #26 for the full
+        // rationale and the attack this closes.
+        if let Some(mut proposal) = Self::recovery_proposal(env.clone()) {
+            let mut new_approvals: Vec<Address> = Vec::new(&env);
+            let mut had_approval = false;
+            for i in 0..proposal.approvals.len() {
+                let a = proposal.approvals.get(i).unwrap();
+                if a == guardian {
+                    had_approval = true;
+                } else {
+                    new_approvals.push_back(a);
+                }
+            }
+            if had_approval {
+                proposal.approvals = new_approvals;
+                if let Some(config) = &recovery_config {
+                    if proposal.approvals.len() < config.threshold {
+                        proposal.ready_at = None;
+                    }
+                }
+                env.storage()
+                    .instance()
+                    .set(&DataKey::RecoveryProposal, &proposal);
+                env.events().publish(
+                    (Symbol::new(&env, "recovery_approval_invalidated"),),
+                    guardian.clone(),
+                );
+            }
+        }
+
         env.events()
             .publish((Symbol::new(&env, "guardian_removed"),), guardian);
         Ok(())
@@ -624,8 +673,19 @@ impl GlobeWallet {
     /// If approvals drop below threshold, the timelock is disarmed
     /// (`ready_at` cleared) — quorum must be reached again from scratch,
     /// restarting the delay window.
+    ///
+    /// # Errors
+    /// * [`WalletError::Unauthorized`] — caller is not a currently
+    ///   registered guardian. Added for consistency with
+    ///   `initiate_recovery`/`approve_recovery`, which both already gate on
+    ///   `require_guardian`; this function was the one exception to that
+    ///   pattern (see issue #26) — harmless on its own since revoking only
+    ///   ever *removes* an approval, but leaving it unchecked meant guardian
+    ///   membership wasn't enforced consistently across the whole approval
+    ///   lifecycle.
     pub fn revoke_recovery_approval(env: Env, guardian: Address) -> Result<(), WalletError> {
         guardian.require_auth();
+        Self::require_guardian(&env, &guardian)?;
         let config = Self::require_recovery_configured(&env)?;
         let mut proposal = Self::require_pending_recovery(&env)?;
         let mut new_approvals: Vec<Address> = Vec::new(&env);
@@ -1606,6 +1666,131 @@ mod tests {
 
         assert_eq!(
             client.try_initiate_recovery(&removed, &Address::generate(&env)),
+            Err(Ok(WalletError::Unauthorized))
+        );
+    }
+
+    #[test]
+    fn test_removed_guardian_approval_no_longer_counts_toward_quorum() {
+        // Direct port of the reproduction sketch in issue #26: removing a
+        // guardian who already approved a pending recovery must invalidate
+        // that approval, not just block them from casting *new* ones (that
+        // half is already covered by `test_removed_guardian_cannot_initiate_recovery`).
+        let (env, admin, guardians, client) = setup_with_guardians(3);
+        client.set_recovery_config(&admin, &2u32, &10u32);
+        let new_admin = Address::generate(&env);
+
+        client.initiate_recovery(&guardians.get(0).unwrap(), &new_admin); // G0
+        client.approve_recovery(&guardians.get(1).unwrap()); // G1 -> quorum (2/2), timelock armed
+        assert!(client.recovery_proposal().unwrap().ready_at.is_some());
+
+        // Admin distrusts G1 (e.g. suspects key compromise colluding on this
+        // very recovery) and removes them. 2 guardians remain (G0, G2)
+        // against threshold 2 — the NotEnoughGuardians guard passes fine,
+        // so removal itself succeeds.
+        client.remove_guardian(&admin, &guardians.get(1).unwrap());
+
+        let proposal = client.recovery_proposal().unwrap();
+        assert_eq!(proposal.approvals.len(), 1);
+        assert_eq!(proposal.approvals.get(0).unwrap(), guardians.get(0).unwrap());
+        // Dropping to 1 approval against threshold 2 must disarm the timelock.
+        assert!(proposal.ready_at.is_none());
+
+        env.ledger().with_mut(|l| l.sequence_number += 100);
+        // Previously this SUCCEEDED using G1's stale, post-removal approval.
+        assert_eq!(
+            client.try_execute_recovery(),
+            Err(Ok(WalletError::RecoveryNotQuorate))
+        );
+        assert_eq!(client.admin(), admin);
+    }
+
+    #[test]
+    fn test_remove_guardian_who_never_approved_leaves_proposal_untouched() {
+        // Removing a guardian who is a member but never voted on the
+        // pending proposal must not perturb `approvals`/`ready_at` at all —
+        // the stripping logic must key off actual proposal membership, not
+        // just "a guardian was removed".
+        let (env, admin, guardians, client) = setup_with_guardians(4);
+        client.set_recovery_config(&admin, &2u32, &10u32);
+        let new_admin = Address::generate(&env);
+
+        client.initiate_recovery(&guardians.get(0).unwrap(), &new_admin); // G0
+        client.approve_recovery(&guardians.get(1).unwrap()); // G1 -> quorum reached
+        let ready_at_before = client.recovery_proposal().unwrap().ready_at;
+        assert!(ready_at_before.is_some());
+
+        // G3 never approved; removing them (4 -> 3 guardians, still >= threshold 2)
+        // must leave the proposal exactly as it was.
+        client.remove_guardian(&admin, &guardians.get(3).unwrap());
+
+        let proposal = client.recovery_proposal().unwrap();
+        assert_eq!(proposal.approvals.len(), 2);
+        assert_eq!(proposal.ready_at, ready_at_before);
+
+        env.ledger().with_mut(|l| l.sequence_number += 10);
+        client.execute_recovery();
+        assert_eq!(client.admin(), new_admin);
+    }
+
+    #[test]
+    fn test_remove_guardian_dequorated_proposal_can_requorum_with_fresh_timelock() {
+        // After a removal de-quorates a proposal, the remaining guardians
+        // must still be able to bring it back to quorum — with a *new*
+        // ready_at, not a resurrected stale one.
+        let (env, admin, guardians, client) = setup_with_guardians(3);
+        client.set_recovery_config(&admin, &2u32, &10u32);
+        let new_admin = Address::generate(&env);
+
+        client.initiate_recovery(&guardians.get(0).unwrap(), &new_admin); // G0
+        client.approve_recovery(&guardians.get(1).unwrap()); // G1 -> quorum, ready_at = seq + 10
+        client.remove_guardian(&admin, &guardians.get(1).unwrap()); // strips G1's approval, ready_at cleared
+        assert!(client.recovery_proposal().unwrap().ready_at.is_none());
+
+        env.ledger().with_mut(|l| l.sequence_number += 5);
+        // G2 (never removed) approves, re-reaching quorum (G0 + G2 = 2/2).
+        client.approve_recovery(&guardians.get(2).unwrap());
+        let rearmed = client.recovery_proposal().unwrap().ready_at;
+        assert!(rearmed.is_some());
+
+        env.ledger().with_mut(|l| l.sequence_number += 10);
+        client.execute_recovery();
+        assert_eq!(client.admin(), new_admin);
+    }
+
+    #[test]
+    fn test_revoke_recovery_approval_rejects_non_guardian() {
+        // `revoke_recovery_approval` previously never checked guardian
+        // membership at all, unlike `initiate_recovery`/`approve_recovery`.
+        let (env, admin, guardians, client) = setup_with_guardians(3);
+        client.set_recovery_config(&admin, &2u32, &10u32);
+        let new_admin = Address::generate(&env);
+        client.initiate_recovery(&guardians.get(0).unwrap(), &new_admin);
+
+        let stranger = Address::generate(&env);
+        assert_eq!(
+            client.try_revoke_recovery_approval(&stranger),
+            Err(Ok(WalletError::Unauthorized))
+        );
+    }
+
+    #[test]
+    fn test_revoke_recovery_approval_rejects_removed_guardian() {
+        // A guardian removed via `remove_guardian` must lose the ability to
+        // call `revoke_recovery_approval` too, not just `initiate_recovery`/
+        // `approve_recovery` — membership is now enforced consistently
+        // across every guardian-authenticated recovery entry point.
+        let (env, admin, guardians, client) = setup_with_guardians(4);
+        client.set_recovery_config(&admin, &2u32, &10u32);
+        let new_admin = Address::generate(&env);
+        client.initiate_recovery(&guardians.get(0).unwrap(), &new_admin);
+        client.approve_recovery(&guardians.get(1).unwrap());
+
+        let removed = guardians.get(1).unwrap();
+        client.remove_guardian(&admin, &removed);
+
+        assert_eq!(
+            client.try_revoke_recovery_approval(&removed),
             Err(Ok(WalletError::Unauthorized))
         );
     }
