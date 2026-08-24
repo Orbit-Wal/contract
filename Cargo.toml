@@ -24,6 +24,21 @@ panic = "abort"
 codegen-units = 1
 lto = true
 
+# Local-debugging-only profile. Inherits everything from `release` (including
+# overflow-checks = true and strip = "symbols") and flips exactly one field:
+# debug-assertions = true, which keeps debug_assert!/debug_assert_eq! invocations
+# compiled in so assertion failures surface during development and testing.
+#
+# The name is a slight misnomer: it does NOT enable runtime logging. Soroban
+# contracts log via env.events().publish(...), which is compiled in by both
+# profiles; what this profile actually toggles is debug-assertion compilation.
+#
+# NOT DEPLOY-SAFE. A WASM built with this profile can behave differently from
+# the audited `release` build (assertions can panic where release would not),
+# so it must never be uploaded via `soroban contract deploy`. Use plain
+# `cargo build --release` for anything destined for testnet/mainnet. Verified
+# today: contracts/ contains no debug_assert! calls, so the practical delta
+# between the two profiles is minimal — but that is not guaranteed to stay true.
 [profile.release-with-logs]
 inherits = "release"
 debug-assertions = true
