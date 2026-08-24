@@ -32,6 +32,14 @@ Build all contracts:
 cargo build --target wasm32-unknown-unknown --release
 ```
 
+> **Debug builds are for local development only.** The workspace also defines
+> a `release-with-logs` profile (`cargo build --profile release-with-logs`)
+> that enables `debug-assertions` on top of `release` to surface assertion
+> failures during development and testing. Despite the name, it does **not**
+> add runtime logging — Soroban contracts log via `env.events().publish(...)`,
+> which is included in both profiles. A WASM built with `release-with-logs`
+> is **never deploy-safe**: always deploy the plain `release` build below.
+
 Run tests:
 
 ```bash
