@@ -24,21 +24,21 @@ pub struct Allowance {
     pub expiry_ledger: u32,
 }
 
-// Error code namespace for token-wrapper contract. Codes start at 2001.
-// Reserved range: 2001-2999 for future extensions.
-    AllowanceExpired = 2001,
-    InsufficientAllowance = 2002,
-    InvalidAmount = 2003,
-    InvalidExpiry = 2004,
 // ── Errors ────────────────────────────────────────────────────────────────────
+//
+// Code namespace for token-wrapper contract errors. Codes start at 2001,
+// reserved range 2001-2999, kept distinct from globe-wallet's WalletError
+// range (1001-1030+, see contracts/globe-wallet/src/lib.rs) so a raw
+// `Error(Contract, #N)` code is unambiguous about which contract raised it
+// without also needing the contract address alongside it.
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum WrapperError {
-    AllowanceExpired = 1,
-    InsufficientAllowance = 2,
-    InvalidAmount = 3,
-    InvalidExpiry = 4,
+    AllowanceExpired = 2001,
+    InsufficientAllowance = 2002,
+    InvalidAmount = 2003,
+    InvalidExpiry = 2004,
 }
 
 #[contract]
