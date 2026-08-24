@@ -76,6 +76,9 @@ you've probably solved a symptom, not the issue.
 
 ## Before you open the PR
 
+- [ ] CI passes for the PR (`cargo check --workspace --all-targets` and
+      `cargo test --workspace`). CI is the baseline build-and-test gate; it
+      complements rather than replaces the runnable evidence required above.
 - [ ] Every Definition of done bullet addressed, with a one-line note per
       bullet on how (in the PR description)
 - [ ] Root cause and rationale written out, not just "fixed"
