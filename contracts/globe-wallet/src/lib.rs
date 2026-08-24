@@ -897,7 +897,25 @@ impl GlobeWallet {
     /// through writing its replacement free of external contract calls. See
     /// `docs/record-spend-reentrancy.md` for the proof and change guidance.
     ///
+    /// `amount` must be strictly positive. `require_auth()` on `user`
+    /// authenticates the *caller*, not the *value* — in the compromised-key
+    /// threat model this function exists to defend against, the attacker
+    /// can already produce valid `user` signatures, so `require_auth()`
+    /// alone provides no protection here. A non-positive `amount` would let
+    /// that same attacker call `record_spend` with a negative value to
+    /// decrease (or zero out) `spent_today` below what was actually spent,
+    /// then immediately follow it with a legitimate large spend the
+    /// configured limit was supposed to block — silently defeating the
+    /// limit. See issue #25 for the full walkthrough.
+    ///
     /// # Errors
+    /// * [`WalletError::InvalidSpendLimit`] — `amount` is not strictly
+    ///   positive. Reuses this variant (rather than adding a new one)
+    ///   because it already means "the numeric value supplied for this
+    ///   spend-limit feature is invalid" and `set_spend_limit` uses it for
+    ///   the analogous negative-input case; a new variant would also
+    ///   collide with the discriminant renumbering tracked in #23, which is
+    ///   touching this same enum in parallel.
     /// * [`WalletError::SpendLimitExceeded`]
     pub fn record_spend(
         env: Env,
@@ -906,6 +924,9 @@ impl GlobeWallet {
         amount: i128,
     ) -> Result<(), WalletError> {
         user.require_auth();
+        if amount <= 0 {
+            return Err(WalletError::InvalidSpendLimit);
+        }
         let limit = Self::get_spend_limit(env.clone(), user.clone(), asset_code.clone());
         if limit == 0 {
             // No limit configured → always allow
@@ -1164,6 +1185,86 @@ mod tests {
         client.record_spend(&user, &code, &999_999_i128);
         assert_eq!(
             client.try_record_spend(&user, &code, &2_i128),
+            Err(Ok(WalletError::SpendLimitExceeded))
+        );
+    }
+
+    #[test]
+    fn test_record_spend_negative_amount_fails() {
+        let (env, _cid, _admin, client) = setup();
+        let user = Address::generate(&env);
+        let code = String::from_str(&env, "XLM");
+        client.set_spend_limit(&user, &code, &1_000_000_i128);
+        assert_eq!(
+            client.try_record_spend(&user, &code, &(-1_i128)),
+            Err(Ok(WalletError::InvalidSpendLimit))
+        );
+    }
+
+    #[test]
+    fn test_record_spend_zero_amount_fails() {
+        let (env, _cid, _admin, client) = setup();
+        let user = Address::generate(&env);
+        let code = String::from_str(&env, "XLM");
+        client.set_spend_limit(&user, &code, &1_000_000_i128);
+        assert_eq!(
+            client.try_record_spend(&user, &code, &0_i128),
+            Err(Ok(WalletError::InvalidSpendLimit))
+        );
+    }
+
+    #[test]
+    fn test_record_spend_rejected_negative_amount_does_not_mutate_state() {
+        // A rejected call must not perturb `spent_today` at all — confirms
+        // the validation short-circuits before any storage write, not just
+        // before the limit comparison.
+        let (env, _cid, _admin, client) = setup();
+        let user = Address::generate(&env);
+        let code = String::from_str(&env, "XLM");
+        client.set_spend_limit(&user, &code, &1_000_000_i128);
+        client.record_spend(&user, &code, &900_000_i128);
+
+        assert_eq!(
+            client.try_record_spend(&user, &code, &(-900_000_i128)),
+            Err(Ok(WalletError::InvalidSpendLimit))
+        );
+
+        // spent_today must still be exactly 900_000, leaving exactly 100_000
+        // of headroom against the 1_000_000 limit. One unit over that
+        // headroom must be rejected...
+        assert_eq!(
+            client.try_record_spend(&user, &code, &100_001_i128),
+            Err(Ok(WalletError::SpendLimitExceeded))
+        );
+        // ...while spending exactly the remaining headroom must succeed,
+        // proving spent_today was neither reset nor left in some other
+        // corrupted value by the rejected negative-amount call.
+        client.record_spend(&user, &code, &100_000_i128);
+    }
+
+    #[test]
+    fn test_record_spend_negative_amount_cannot_bypass_daily_limit() {
+        // Reproduction of the exact attack in issue #25: reset spent_today
+        // to (near) zero with a negative call, then spend again past what
+        // the configured limit was supposed to allow for the day.
+        let (env, _cid, _admin, client) = setup();
+        let user = Address::generate(&env);
+        let code = String::from_str(&env, "XLM");
+        client.set_spend_limit(&user, &code, &1_000_000_i128);
+        client.record_spend(&user, &code, &900_000_i128);
+
+        // Attempted reset via negative amount must be rejected outright...
+        assert_eq!(
+            client.try_record_spend(&user, &code, &(-900_000_i128)),
+            Err(Ok(WalletError::InvalidSpendLimit))
+        );
+
+        // ...so the follow-up spend that the attack depended on is still
+        // bound by the *original*, un-reset spent_today (900_000), and a
+        // further 999_999 remains correctly rejected as exceeding the
+        // 1_000_000 daily limit.
+        assert_eq!(
+            client.try_record_spend(&user, &code, &999_999_i128),
             Err(Ok(WalletError::SpendLimitExceeded))
         );
     }
