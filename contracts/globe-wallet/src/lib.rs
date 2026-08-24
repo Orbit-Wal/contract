@@ -126,6 +126,11 @@ pub struct RecoveryProposal {
 
 // ── Errors ────────────────────────────────────────────────────────────────────
 
+// Every discriminant below is deliberately part of one contiguous `1001+`
+// namespace (see issue #23) — do not introduce a second, lower-numbered
+// scheme again. token-wrapper's WrapperError uses a separate `2001+`
+// namespace (see contracts/token-wrapper/src/lib.rs) precisely so a raw
+// `Error(Contract, #N)` code is unambiguous about which contract raised it.
 #[contracterror]
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum WalletError {
@@ -138,42 +143,42 @@ pub enum WalletError {
     /// Payment would exceed the daily spend limit for this asset
     SpendLimitExceeded = 1007,
     NoAssetsProvided = 1008,
-    NoPendingAdmin = 9,
-    SpendOverflow = 10,
-    AssetLimitExceeded = 11,
-    MaxAssetsReached = 12,
-    UpgradeAlreadyPending = 13,
-    UpgradeNotPending = 14,
-    UpgradeHashMismatch = 15,
-    UpgradeNotReady = 16,
-    UpgradeFailed = 17,
+    NoPendingAdmin = 1009,
+    SpendOverflow = 1010,
+    AssetLimitExceeded = 1011,
+    MaxAssetsReached = 1012,
+    UpgradeAlreadyPending = 1013,
+    UpgradeNotPending = 1014,
+    UpgradeHashMismatch = 1015,
+    UpgradeNotReady = 1016,
+    UpgradeFailed = 1017,
     /// Guardian address already registered.
-    GuardianAlreadyAdded = 18,
+    GuardianAlreadyAdded = 1018,
     /// Address is not a registered guardian.
-    GuardianNotFound = 19,
+    GuardianNotFound = 1019,
     /// Recovery threshold must be `1 < threshold <= guardians.len()`.
-    InvalidRecoveryThreshold = 20,
+    InvalidRecoveryThreshold = 1020,
     /// `add_guardian`/`set_recovery_config` would leave threshold >
     /// guardian count, or guardians.len() below the required minimum.
-    NotEnoughGuardians = 21,
+    NotEnoughGuardians = 1021,
     /// No recovery threshold/delay configured yet — call `set_recovery_config` first.
-    RecoveryNotConfigured = 22,
+    RecoveryNotConfigured = 1022,
     /// A recovery proposal is already in flight; cancel or execute it first.
-    RecoveryAlreadyPending = 23,
+    RecoveryAlreadyPending = 1023,
     /// No recovery proposal is currently pending.
-    NoPendingRecovery = 24,
+    NoPendingRecovery = 1024,
     /// Guardian has already approved the pending proposal.
-    AlreadyApproved = 25,
+    AlreadyApproved = 1025,
     /// Guardian has not approved the pending proposal (nothing to revoke).
-    ApprovalNotFound = 26,
+    ApprovalNotFound = 1026,
     /// Quorum reached but the timelock delay has not yet elapsed.
-    RecoveryNotReady = 27,
+    RecoveryNotReady = 1027,
     /// Approvals dropped below threshold since quorum was reached; timelock reset.
-    RecoveryNotQuorate = 28,
+    RecoveryNotQuorate = 1028,
     /// Asset code and issuer configuration is invalid
-    InvalidAssetInfo = 29,
+    InvalidAssetInfo = 1029,
     /// Proposed wasm hash is not registered on-chain (never uploaded via upload_contract_wasm)
-    UpgradeWasmNotUploaded = 30,
+    UpgradeWasmNotUploaded = 1030,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
