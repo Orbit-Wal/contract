@@ -1121,7 +1121,6 @@ mod tests {
     extern crate std;
 
     use super::*;
-    use super::*;
     use soroban_sdk::{
         testutils::{Address as _, Ledger as _},
         Env, String, BytesN, Address,
