@@ -179,6 +179,8 @@ pub enum WalletError {
     InvalidAssetInfo = 1029,
     /// Proposed wasm hash is not registered on-chain (never uploaded via upload_contract_wasm)
     UpgradeWasmNotUploaded = 1030,
+    /// Guardian limit exceeded.
+    GuardianLimitExceeded = 1031,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -417,6 +419,11 @@ impl GlobeWallet {
     //    so a guardian having second thoughts can't be steam-rolled by a
     //    stale countdown started earlier.
 
+    /// Maximum guardians a wallet can have.
+    /// Chosen to stay well within instance storage limits and bound O(n) scan costs.
+    /// Social recovery sets rarely exceed 5-9 members in practice.
+    pub const MAX_GUARDIANS: u32 = 9;
+
     /// Register a new guardian. Admin-authorized.
     pub fn add_guardian(env: Env, admin: Address, guardian: Address) -> Result<(), WalletError> {
         admin.require_auth();
@@ -426,6 +433,9 @@ impl GlobeWallet {
             return Err(WalletError::GuardianAlreadyAdded);
         }
         let mut guardians = Self::guardians(env.clone());
+        if guardians.len() >= Self::MAX_GUARDIANS {
+            return Err(WalletError::GuardianLimitExceeded);
+        }
         guardians.push_back(guardian.clone());
         env.storage().instance().set(&DataKey::Guardians, &guardians);
         membership.set(guardian.clone(), true);
@@ -2291,5 +2301,22 @@ mod tests {
         env.ledger().with_mut(|l| l.sequence_number += 50_000);
 
         assert_eq!(client.get_spend_limit(&user, &code), 1_000_000);
+    }
+
+    #[test]
+    fn test_guardian_list_has_upper_bound() {
+        let (env, _cid, admin, client) = setup();
+        for _ in 0..GlobeWallet::MAX_GUARDIANS {
+            let g = Address::generate(&env);
+            client.add_guardian(&admin, &g);
+        }
+        assert_eq!(client.guardians().len(), GlobeWallet::MAX_GUARDIANS);
+
+        let g_extra = Address::generate(&env);
+        assert_eq!(
+            client.try_add_guardian(&admin, &g_extra),
+            Err(Ok(WalletError::GuardianLimitExceeded))
+        );
+        assert_eq!(client.guardians().len(), GlobeWallet::MAX_GUARDIANS);
     }
 }
