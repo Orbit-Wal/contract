@@ -397,9 +397,9 @@ impl GlobeWallet {
 
     // ── Guardian-Based Admin Recovery ────────────────────────────────────────
     //
-    // See `docs/design/recovery/RECOVERY.md` in the mobile repo for the full
-    // design rationale, threat model, and interaction spec this section
-    // implements. Summary of the invariants enforced here:
+    // See `https://github.com/Orbit-Wal/mobile/blob/main/docs/design/recovery/RECOVERY.md`
+    // for the full design rationale, threat model, and interaction spec this
+    // section implements. Summary of the invariants enforced here:
     //
     // 1. `execute_recovery` never calls `require_admin`/`current.require_auth()`
     //    — by construction the whole point is that the admin key is gone.
