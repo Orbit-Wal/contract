@@ -21,8 +21,6 @@ use soroban_sdk::{
     Vec,
 };
 
-/// Maximum assets per wallet — prevents unbounded O(n) scans.
-const MAX_ASSETS: u32 = 50;
 
 // ── Storage Keys ──────────────────────────────────────────────────────────────
 
@@ -787,7 +785,7 @@ impl GlobeWallet {
 
     // ── Asset Registry ────────────────────────────────────────────────────────
 
-    /// Maximum assets a single user can whitelist.
+    /// Maximum assets a single user can whitelist — prevents unbounded O(n) scans.
     /// Chosen to stay well within Soroban per-contract storage (∼100 KB):
     /// each entry is ∼200 bytes → ∼50 entries ≈ 10 KB, far below the ∼100 KB ceiling.
     pub const MAX_ASSETS: u32 = 50;
@@ -1132,7 +1130,7 @@ mod tests {
     }
 
     fn fill_to_max(env: &Env, client: &GlobeWalletClient, user: &Address) {
-        for i in 0..MAX_ASSETS {
+        for i in 0..GlobeWallet::MAX_ASSETS {
             let code = make_code(env, i);
             let asset = AssetInfo { code, issuer: Some(Address::generate(env)) };
             client.add_asset(user, &asset);
