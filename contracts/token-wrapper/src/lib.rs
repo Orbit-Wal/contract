@@ -71,14 +71,20 @@ impl TokenWrapper {
             return Err(WrapperError::InvalidExpiry);
         }
         let key = DataKey::Allowance(owner.clone(), spender.clone());
-        env.storage()
-            .persistent()
-            .set(&key, &Allowance { amount, expiry_ledger });
+        env.storage().persistent().set(
+            &key,
+            &Allowance {
+                amount,
+                expiry_ledger,
+            },
+        );
         // Allowance carries an explicit `expiry_ledger` contract; storage TTL
         // must never expire *before* that ledger or the allowance would vanish
         // early through archival rather than through its own stated semantics.
         let extend_to = expiry_ledger.saturating_sub(env.ledger().sequence());
-        env.storage().persistent().extend_ttl(&key, extend_to, extend_to);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, extend_to, extend_to);
         env.events().publish(
             (Symbol::new(&env, "approved"),),
             (owner, spender, amount, expiry_ledger),
@@ -89,10 +95,10 @@ impl TokenWrapper {
     /// Return current allowance for (owner, spender).
     pub fn allowance(env: Env, owner: Address, spender: Address) -> Allowance {
         let key = DataKey::Allowance(owner, spender);
-        env.storage()
-            .persistent()
-            .get(&key)
-            .unwrap_or(Allowance { amount: 0, expiry_ledger: 0 })
+        env.storage().persistent().get(&key).unwrap_or(Allowance {
+            amount: 0,
+            expiry_ledger: 0,
+        })
     }
 
     /// Transfer tokens from `from` to `to` using a previously granted allowance.
@@ -112,11 +118,10 @@ impl TokenWrapper {
             return Err(WrapperError::InvalidAmount);
         }
         let key = DataKey::Allowance(from.clone(), spender.clone());
-        let current: Allowance = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .unwrap_or(Allowance { amount: 0, expiry_ledger: 0 });
+        let current: Allowance = env.storage().persistent().get(&key).unwrap_or(Allowance {
+            amount: 0,
+            expiry_ledger: 0,
+        });
         if current.expiry_ledger < env.ledger().sequence() {
             return Err(WrapperError::AllowanceExpired);
         }
@@ -127,9 +132,17 @@ impl TokenWrapper {
             amount: current.amount - amount,
             expiry_ledger: current.expiry_ledger,
         };
+        // Persist the new allowance before calling the external token contract.
+        // Soroban's atomicity model guarantees that if the subsequent `transfer` call
+        // fails (e.g. insufficient underlying balance, trap), the entire transaction
+        // is rolled back, safely undoing this allowance debit.
         env.storage().persistent().set(&key, &new_allowance);
-        let extend_to = current.expiry_ledger.saturating_sub(env.ledger().sequence());
-        env.storage().persistent().extend_ttl(&key, extend_to, extend_to);
+        let extend_to = current
+            .expiry_ledger
+            .saturating_sub(env.ledger().sequence());
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, extend_to, extend_to);
         let token_client = token::Client::new(&env, &token_id);
         token_client.transfer(&from, &to, &amount);
         env.events().publish(
@@ -325,5 +338,24 @@ mod tests {
         client.approve(&owner, &spender, &500, &200);
         env.ledger().with_mut(|l| l.sequence_number = 200); // exactly at expiry_ledger
         client.transfer_from(&spender, &token_id, &owner, &to, &100); // currently succeeds — lock this in explicitly
+    }
+
+    #[test]
+    fn test_allowance_state_rolls_back_if_underlying_transfer_fails() {
+        let (env, _id, client) = setup();
+        let admin = Address::generate(&env);
+        let owner = Address::generate(&env);
+        let spender = Address::generate(&env);
+        let to = Address::generate(&env);
+        let (token_id, token_admin, _token) = create_token_contract(&env, &admin);
+        token_admin.mint(&owner, &100); // owner has only 100 real tokens
+        env.ledger().with_mut(|l| l.sequence_number = 100);
+        client.approve(&owner, &spender, &500, &200); // allowance says 500 is fine
+                                                      // Attempt to move 300 — passes the allowance check (500 >= 300) but exceeds owner's real balance (100)
+        assert!(client
+            .try_transfer_from(&spender, &token_id, &owner, &to, &300)
+            .is_err());
+        let a = client.allowance(&owner, &spender);
+        assert_eq!(a.amount, 500); // must still read the ORIGINAL allowance, proving the write was rolled back
     }
 }
