@@ -242,6 +242,15 @@ impl GlobeWallet {
         Ok(())
     }
 
+    /// Internal helper to guarantee the structural invariant that any time the
+    /// admin changes, the pending-admin entry keyed to the old admin's address is cleaned up.
+    fn set_admin_and_clear_pending(env: &Env, old_admin: &Address, new_admin: &Address) {
+        env.storage()
+            .instance()
+            .remove(&DataKey::PendingAdmin(old_admin.clone()));
+        env.storage().instance().set(&DataKey::Admin, new_admin);
+    }
+
     /// Accept a pending admin proposal.
     pub fn accept_admin(env: Env, candidate: Address) -> Result<(), WalletError> {
         candidate.require_auth();
@@ -258,10 +267,7 @@ impl GlobeWallet {
         if pending != candidate {
             return Err(WalletError::Unauthorized);
         }
-        env.storage().instance().set(&DataKey::Admin, &candidate);
-        env.storage()
-            .instance()
-            .remove(&DataKey::PendingAdmin(admin.clone()));
+        Self::set_admin_and_clear_pending(&env, &admin, &candidate);
         env.events().publish(
             (Symbol::new(&env, "admin_transferred"),),
             (admin, candidate),
@@ -748,12 +754,7 @@ impl GlobeWallet {
             .instance()
             .get(&DataKey::Admin)
             .ok_or(WalletError::NotInitialized)?;
-        env.storage()
-            .instance()
-            .remove(&DataKey::PendingAdmin(old_admin.clone()));
-        env.storage()
-            .instance()
-            .set(&DataKey::Admin, &proposal.new_admin);
+        Self::set_admin_and_clear_pending(&env, &old_admin, &proposal.new_admin);
         env.storage().instance().remove(&DataKey::RecoveryProposal);
         // Same event name/shape as a normal transfer: downstream indexers
         // and the mobile app don't need to special-case recovery-driven
@@ -1479,6 +1480,22 @@ mod tests {
         assert_eq!(client.admin(), admin);
         assert_eq!(
             client.try_accept_admin(&candidate),
+            Err(Ok(WalletError::NoPendingAdmin))
+        );
+    }
+
+    #[test]
+    fn test_pending_admin_entry_removed_after_normal_accept() {
+        let (env, _cid, admin, client) = setup();
+        let candidate = Address::generate(&env);
+        client.propose_admin(&admin, &candidate);
+        client.accept_admin(&candidate);
+        
+        // Explicitly assert the old PendingAdmin(admin) key no longer resolves — a fresh propose
+        // targeting the SAME old admin address should find no leftover pending entry:
+        client.propose_admin(&candidate, &admin); // new admin proposes transferring back
+        assert_eq!(
+            client.try_accept_admin(&admin), // should require a fresh acceptance, not reuse stale state
             Err(Ok(WalletError::NoPendingAdmin))
         );
     }
