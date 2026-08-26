@@ -1699,7 +1699,7 @@ mod tests {
         let never_uploaded_hash = BytesN::from_array(&env, &[42u8; 32]);
 
         // propose_upgrade should succeed even with an invalid hash
-        assert_eq!(client.try_propose_upgrade(&admin, &never_uploaded_hash, &0u32), Ok(()));
+        assert_eq!(client.try_propose_upgrade(&admin, &never_uploaded_hash, &0u32), Ok(Ok(())));
 
         // The proposal is stored
         let cid = id.clone();
@@ -1929,6 +1929,190 @@ mod tests {
             client.try_revoke_recovery_approval(&removed),
             Err(Ok(WalletError::Unauthorized))
         );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Issue #28 / ADR-028-1: set_recovery_config locked while a RecoveryProposal
+    // is pending. See docs/context/issue-28-context.md §5-§6 for the state
+    // transition matrix and test matrix this suite implements.
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_set_recovery_config_allowed_when_no_proposal() {
+        let (_env, admin, _guardians, client) = setup_with_guardians(3);
+        assert_eq!(
+            client.try_set_recovery_config(&admin, &2u32, &10u32),
+            Ok(Ok(()))
+        );
+        let config = client.recovery_config().unwrap();
+        assert_eq!(config.threshold, 2);
+        assert_eq!(config.delay_in_ledgers, 10);
+    }
+
+    #[test]
+    fn test_set_recovery_config_blocked_when_proposal_pending() {
+        // Sub-quorum pending proposal (matrix row 2 of §5): only 1 of 3
+        // required approvals recorded so far.
+        let (env, admin, guardians, client) = setup_with_guardians(3);
+        client.set_recovery_config(&admin, &3u32, &10u32);
+        let new_admin = Address::generate(&env);
+        client.initiate_recovery(&guardians.get(0).unwrap(), &new_admin);
+
+        assert_eq!(
+            client.try_set_recovery_config(&admin, &2u32, &20u32),
+            Err(Ok(WalletError::RecoveryConfigLocked))
+        );
+        // Rejected call must not mutate RecoveryConfig at all.
+        let config = client.recovery_config().unwrap();
+        assert_eq!(config.threshold, 3);
+        assert_eq!(config.delay_in_ledgers, 10);
+    }
+
+    #[test]
+    fn test_set_recovery_config_blocked_at_quorum_before_timelock_elapses() {
+        // Matrix row 3 of §5: quorum just reached, `ready_at` armed but not
+        // yet elapsed. Both a lower and a higher threshold must be rejected.
+        let (env, admin, guardians, client) = setup_with_guardians(3);
+        client.set_recovery_config(&admin, &2u32, &10u32);
+        let new_admin = Address::generate(&env);
+        client.initiate_recovery(&guardians.get(0).unwrap(), &new_admin);
+        client.approve_recovery(&guardians.get(1).unwrap());
+
+        assert_eq!(
+            client.try_set_recovery_config(&admin, &3u32, &5u32),
+            Err(Ok(WalletError::RecoveryConfigLocked))
+        );
+
+        let proposal = client.recovery_proposal().unwrap();
+        assert!(proposal.ready_at.is_some());
+        let config = client.recovery_config().unwrap();
+        assert_eq!(config.threshold, 2);
+        assert_eq!(config.delay_in_ledgers, 10);
+    }
+
+    #[test]
+    fn test_set_recovery_config_blocked_when_ready_to_execute() {
+        // Matrix row 5 of §5: timelock already elapsed, proposal is
+        // executable. Reconfiguration must still be rejected — the admin
+        // must let it execute or explicitly cancel it, not reconfigure
+        // around it.
+        let (env, admin, guardians, client) = setup_with_guardians(3);
+        client.set_recovery_config(&admin, &2u32, &10u32);
+        let new_admin = Address::generate(&env);
+        client.initiate_recovery(&guardians.get(0).unwrap(), &new_admin);
+        client.approve_recovery(&guardians.get(1).unwrap());
+        env.ledger().with_mut(|l| l.sequence_number += 10);
+
+        assert_eq!(
+            client.try_set_recovery_config(&admin, &3u32, &99u32),
+            Err(Ok(WalletError::RecoveryConfigLocked))
+        );
+
+        // The original config/proposal is untouched, so execution proceeds
+        // exactly as if the reconfiguration attempt had never happened.
+        client.execute_recovery();
+        assert_eq!(client.admin(), new_admin);
+    }
+
+    #[test]
+    fn test_set_recovery_config_allowed_after_proposal_cancelled() {
+        let (env, admin, guardians, client) = setup_with_guardians(3);
+        client.set_recovery_config(&admin, &2u32, &10u32);
+        let new_admin = Address::generate(&env);
+        client.initiate_recovery(&guardians.get(0).unwrap(), &new_admin);
+        client.cancel_recovery(&admin);
+
+        assert_eq!(
+            client.try_set_recovery_config(&admin, &3u32, &15u32),
+            Ok(Ok(()))
+        );
+        let config = client.recovery_config().unwrap();
+        assert_eq!(config.threshold, 3);
+        assert_eq!(config.delay_in_ledgers, 15);
+    }
+
+    #[test]
+    fn test_set_recovery_config_allowed_after_proposal_executed() {
+        let (env, admin, guardians, client) = setup_with_guardians(3);
+        client.set_recovery_config(&admin, &2u32, &10u32);
+        let new_admin = Address::generate(&env);
+        client.initiate_recovery(&guardians.get(0).unwrap(), &new_admin);
+        client.approve_recovery(&guardians.get(1).unwrap());
+        env.ledger().with_mut(|l| l.sequence_number += 10);
+        client.execute_recovery();
+        assert_eq!(client.admin(), new_admin);
+
+        // `execute_recovery` already removed the RecoveryProposal, so the
+        // new admin can reconfigure immediately, in the same test/ledger.
+        assert_eq!(
+            client.try_set_recovery_config(&new_admin, &3u32, &15u32),
+            Ok(Ok(()))
+        );
+        let config = client.recovery_config().unwrap();
+        assert_eq!(config.threshold, 3);
+        assert_eq!(config.delay_in_ledgers, 15);
+    }
+
+    #[test]
+    fn test_approve_recovery_uses_config_stable_across_proposal_lifetime() {
+        // Regression test for the invariant documented on `approve_recovery`:
+        // since `set_recovery_config` cannot run while this proposal exists,
+        // every approval sees exactly the same `threshold`/`delay_in_ledgers`
+        // that was active at `initiate_recovery` time.
+        let (env, admin, guardians, client) = setup_with_guardians(3);
+        client.set_recovery_config(&admin, &3u32, &7u32);
+        let new_admin = Address::generate(&env);
+        client.initiate_recovery(&guardians.get(0).unwrap(), &new_admin);
+
+        client.approve_recovery(&guardians.get(1).unwrap());
+        assert_eq!(
+            client.try_set_recovery_config(&admin, &2u32, &1u32),
+            Err(Ok(WalletError::RecoveryConfigLocked))
+        );
+
+        client.approve_recovery(&guardians.get(2).unwrap());
+        let proposal = client.recovery_proposal().unwrap();
+        let expected_ready_at = env.ledger().sequence() + 7;
+        assert_eq!(proposal.ready_at, Some(expected_ready_at));
+    }
+
+    #[test]
+    fn test_non_admin_cannot_bypass_recovery_config_lock() {
+        // `require_admin` is checked before the `RecoveryConfigLocked` guard,
+        // so a non-admin caller gets `Unauthorized` regardless of whether a
+        // proposal is pending — the lock never leaks proposal-existence
+        // information to unauthorized callers.
+        let (env, admin, guardians, client) = setup_with_guardians(3);
+        client.set_recovery_config(&admin, &2u32, &10u32);
+        let new_admin = Address::generate(&env);
+        client.initiate_recovery(&guardians.get(0).unwrap(), &new_admin);
+
+        let stranger = Address::generate(&env);
+        assert_eq!(
+            client.try_set_recovery_config(&stranger, &2u32, &10u32),
+            Err(Ok(WalletError::Unauthorized))
+        );
+    }
+
+    #[test]
+    fn test_add_remove_guardian_still_allowed_mid_recovery_despite_config_lock() {
+        // ADR-028-1 explicitly does NOT extend the new lock to guardian
+        // membership: `add_guardian`/`remove_guardian` remain governed only
+        // by the issue #26 reconciliation logic.
+        let (env, admin, guardians, client) = setup_with_guardians(4);
+        client.set_recovery_config(&admin, &3u32, &10u32);
+        let new_admin = Address::generate(&env);
+        client.initiate_recovery(&guardians.get(0).unwrap(), &new_admin);
+
+        assert_eq!(
+            client.try_set_recovery_config(&admin, &2u32, &5u32),
+            Err(Ok(WalletError::RecoveryConfigLocked))
+        );
+
+        let extra_guardian = Address::generate(&env);
+        client.add_guardian(&admin, &extra_guardian);
+        client.remove_guardian(&admin, &extra_guardian);
+        assert_eq!(client.guardians().len(), 4);
     }
 
     #[test]

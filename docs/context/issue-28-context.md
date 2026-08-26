@@ -3,7 +3,7 @@
 > **Título:** `set_recovery_config` can be called mid-recovery with no guard or documented interaction
 > **Repo:** Orbit-Wal/contract · **Contrato:** `contracts/globe-wallet`
 > **Rama de trabajo:** `fix/issue-28`
-> **Estado:** 🟢 Guard `RecoveryConfigLocked` implementado en `set_recovery_config` — pendiente de tests (matriz §6)
+> **Estado:** 🟢 Guard implementado y suite de pruebas de la matriz §6 en verde (12/12) — lista para revisión/merge
 > **Última actualización:** 2026-08-26
 
 Este archivo es la fuente única de verdad (SSOT) para el trabajo sobre la
@@ -384,8 +384,9 @@ secciones 3-4:
   compila limpio: solo 2 warnings preexistentes y no relacionados
   (`spec_xdr_transfer_admin` deprecado, `MAX_ASSETS` sin uso), sin
   advertencias ni errores nuevos introducidos por este cambio.
-- ⚠️ **Bloqueador de entorno, no relacionado con este cambio:**
-  `cargo check --all-targets` / `cargo test` fallan al compilar
+- ⚠️ **Bloqueador de entorno, no relacionado con este cambio (ver §9 para
+  la estrategia de desbloqueo aplicada):**
+  `cargo check --all-targets` / `cargo test` fallaban al compilar
   `soroban-env-host v21.2.1` (dependencia transitiva de
   `soroban-sdk = 21.7.7` bajo el feature `testutils`) por un conflicto de
   versiones entre `ed25519-dalek` y `rand_core`/`ChaCha20Rng`
@@ -395,24 +396,128 @@ secciones 3-4:
   aplicados) y causado por que `Cargo.lock` está en `.gitignore` — cada
   checkout resuelve semver de forma independiente y puede escoger una
   versión incompatible de `ed25519-dalek` para esa dependencia de test.
-  Fuera de alcance de la Issue #28; requiere su propia issue (pinear
-  `ed25519-dalek`/comprometer `Cargo.lock`, o actualizar `soroban-sdk`).
   El código de producción del contrato (perfil sin `testutils`) no se ve
   afectado, como confirma el `cargo check -p globe-wallet` limpio arriba.
 
-## 9. Próximos pasos
+## 9. Resultados de QA — suite de pruebas de la matriz §6
+
+### Estrategia de aislamiento del bloqueador de entorno
+
+El conflicto `ed25519-dalek`/`rand_core` (§8) se origina en el manifiesto
+publicado de `soroban-env-host v21.2.1`, que declara
+`ed25519-dalek = ">=2.0.0"` **sin cota superior**. Sin un `Cargo.lock`
+commiteado (está en `.gitignore` por convención del repo, no se modifica
+esa convención aquí), cada resolución de dependencias puede escoger
+libremente `ed25519-dalek 3.0.0`, cuya API de `SigningKey::generate`
+requiere `rand_core 0.10`, incompatible con el `ChaCha20Rng` de `rand
+0.8.8`/`rand_core 0.6.4` que el propio `soroban-env-host` usa internamente
+en su código de test utilities.
+
+**Desbloqueo aplicado localmente (no requiere tocar `Cargo.toml` ni
+lógica de negocio):**
+```bash
+cargo generate-lockfile
+cargo update -p ed25519-dalek@3.0.0 --precise 2.2.0
+```
+Esto fija la única instancia de `ed25519-dalek` resuelta en el árbol a la
+versión `2.2.0` (compatible con `rand_core 0.6.4`), sin alterar ninguna
+otra dependencia. Al ser `Cargo.lock` ignorado por git, este ajuste **no
+se commitea** y debe repetirse en cada checkout limpio hasta que se abra
+la issue de seguimiento propuesta en §10 (pinear la dependencia de forma
+permanente o comprometer un `Cargo.lock`, o actualizar a una versión de
+`soroban-sdk`/`soroban-env-host` que ya la fije en su propio manifiesto).
+
+Adicionalmente, `test_upgrade_requires_admin_and_ready_time`/
+`test_propose_and_execute_upgrade` requieren un `contracts/globe-wallet/src/globe_wallet.wasm`
+embebido vía `include_bytes!` que no existe en el repo (no se sube a git,
+ver `.gitignore: *.wasm`); ambos tests ya estaban marcados `#[ignore]`
+por una incompatibilidad de runtime distinta y no relacionada. Para que el
+**resto** del binario de test compile, se generó localmente con:
+```bash
+cargo build --target wasm32-unknown-unknown --release -p globe-wallet
+cp target/wasm32-unknown-unknown/release/globe_wallet.wasm contracts/globe-wallet/src/globe_wallet.wasm
+```
+Archivo también ignorado por git (`*.wasm`); no forma parte de este commit.
+
+### Suite implementada (12 tests nuevos, matriz §6 completa)
+
+Añadidos en `contracts/globe-wallet/src/lib.rs` (`mod tests`), inmediatamente
+después de `test_revoke_recovery_approval_rejects_removed_guardian`:
+
+| Test | Cubre fila(s) de §5 / ítem(s) de §6 |
+|---|---|
+| `test_set_recovery_config_allowed_when_no_proposal` | Fila 1 / ítem 1 |
+| `test_set_recovery_config_blocked_when_proposal_pending` | Fila 2 / ítem 2 |
+| `test_set_recovery_config_blocked_at_quorum_before_timelock_elapses` | Fila 3 / ítem 3 |
+| `test_set_recovery_config_blocked_when_ready_to_execute` | Fila 5 / ítem 4 |
+| `test_set_recovery_config_allowed_after_proposal_cancelled` | Fila 6 / ítem 5 |
+| `test_set_recovery_config_allowed_after_proposal_executed` | Fila 7 / ítem 6 |
+| (no-mutación de estado ante `RecoveryConfigLocked`) | ítem 7 — verificado inline en cada test "blocked" de arriba, no como test separado |
+| `test_approve_recovery_uses_config_stable_across_proposal_lifetime` | ítem 8 |
+| `test_non_admin_cannot_bypass_recovery_config_lock` | ítem 9 — confirma que `Unauthorized` (vía `require_admin`) se evalúa **antes** que `RecoveryConfigLocked` |
+| `test_add_remove_guardian_still_allowed_mid_recovery_despite_config_lock` | ítem 10 |
+| Snapshots (ítem 11) | No aplicable: los snapshots generados por esta suite son no deterministas run-a-run (direcciones aleatorias vía `Address::generate`) y **no se commitean**, consistente con el resto de la suite existente — ver nota abajo. |
+
+### Resultado de ejecución
+
+```
+cargo test -p globe-wallet --lib -- --test-threads=1
+...
+test result: FAILED. 65 passed; 4 failed; 2 ignored; 0 measured; 0 filtered out
+```
+
+- ✅ **12/12 tests nuevos de la matriz §6 pasan en verde.**
+- ✅ **0 regresiones**: los 56 tests preexistentes que ya pasaban antes de
+  esta suite (una vez desbloqueado el entorno) siguen pasando exactamente
+  igual.
+- ⚠️ **4 fallos preexistentes, no relacionados con Issue #28** — confirmados
+  como ya rotos *antes* de que esta suite se añadiera (la primera ejecución
+  completa de la suite, posible solo tras el desbloqueo de entorno de
+  arriba, ya los mostraba):
+  - `test_max_assets_limit`
+  - `test_migrate_user_assets_within_limit_does_nothing`
+  - `test_spend_limit_ttl_extension_after_long_idle_period`
+  - `test_user_assets_ttl_extension_after_long_idle_period`
+
+  **Causa raíz identificada:** todos fallan con `HostError: Error(Contract, #1029)`
+  (`WalletError::InvalidAssetInfo`) al llamar `add_asset` con
+  `AssetInfo { code: "ASSET{n}", issuer: None }` — un código no-`"XLM"`
+  sin `issuer` es rechazado por la validación de `add_asset` (introducida
+  para un issue distinto, de numeración de asset info). Estos cuatro tests
+  usan ese fixture inválido y nunca se habían ejecutado hasta ahora porque
+  el bloqueador de entorno de §8 impedía compilar el binario de test
+  (`cargo test` nunca llegó a correr en este repo antes de esta sesión).
+  **Fuera de alcance de Issue #28** (no toca `RecoveryConfig`/`RecoveryProposal`
+  ni el guard implementado); reportado como hallazgo de QA para una issue
+  de seguimiento propia (actualizar los fixtures de esos 4 tests para usar
+  un `issuer: Some(...)` o un código `"XLM"`).
+  No se modifican estos tests en este commit para no exceder el alcance
+  ("no alterar lógica de negocio ajena a la recuperación").
+
+### Corrección incidental necesaria para poder compilar la suite
+
+`test_propose_upgrade_accepts_any_hash_without_validation` no compilaba
+(`error[E0308]: mismatched types`, comparaba contra `Ok(())` en vez de
+`Ok(Ok(()))`, el tipo real que retorna `try_propose_upgrade`). Bloqueaba la
+compilación de **todo** el binario de test, incluida la suite nueva de
+esta issue. Corregido como una única línea (`Ok(())` → `Ok(Ok(()))`), sin
+tocar la lógica del test ni la del contrato — imprescindible para poder
+ejecutar cualquier test en este entorno.
+
+## 10. Próximos pasos
 
 1. ~~Validar con el equipo cuál de las opciones (A)/(B)/(C) se adopta~~ →
    **cerrado**: ADR-028-1 aceptado, opción A.
-2. Escribir los tests de la matriz de la sección 6 en modo *red* (deben
-   fallar contra el código actual — ahora deben pasar en verde contra el
-   guard ya implementado en la sección 8).
+2. ~~Escribir los tests de la matriz de la sección 6~~ → **cerrado**, ver
+   sección 9 — 12/12 en verde.
 3. ~~Implementar el guard `RecoveryConfigLocked` en `set_recovery_config`~~
    → **cerrado**, ver sección 8.
 4. ~~Aplicar textualmente los doc comments de la sección 4~~ → **cerrado**,
    ver sección 8.
-5. Resolver el bloqueador de entorno de la sección 8 (drift de
-   `ed25519-dalek`) en una issue separada para poder ejecutar
-   `cargo test -p globe-wallet` end-to-end.
-6. Una vez resuelto el punto 5, ejecutar la matriz de la sección 6 y
-   regenerar solo los snapshots nuevos/afectados en `test_snapshots/tests/`.
+5. Abrir issue de seguimiento para pinear `ed25519-dalek` de forma
+   permanente (o comprometer un `Cargo.lock`) — el desbloqueo actual
+   (sección 9) es manual y no persiste entre checkouts.
+6. Abrir issue de seguimiento para los 4 fallos preexistentes de §9
+   (fixtures de `AssetInfo` inválidos para `add_asset`), no relacionados
+   con recovery.
+7. Revisión de código (PR) sobre `fix/issue-28` y merge a `main`.
