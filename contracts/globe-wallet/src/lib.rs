@@ -179,6 +179,8 @@ pub enum WalletError {
     InvalidAssetInfo = 1029,
     /// Proposed wasm hash is not registered on-chain (never uploaded via upload_contract_wasm)
     UpgradeWasmNotUploaded = 1030,
+    /// `set_recovery_config` called while a `RecoveryProposal` is pending; cancel or execute it first.
+    RecoveryConfigLocked = 1031,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -564,7 +566,21 @@ impl GlobeWallet {
     /// Configure (or reconfigure) the M-of-N recovery threshold and the
     /// post-quorum timelock delay. Admin-authorized.
     ///
+    /// Locked while a `RecoveryProposal` is pending (issue #28 / ADR-028-1):
+    /// the config governing an in-flight recovery must stay fixed for that
+    /// proposal's entire lifecycle. Without this guard, an admin (or an
+    /// attacker who has coerced/compromised the admin key) could lower
+    /// `threshold` mid-recovery to manufacture quorum out of approvals that
+    /// never met the original bar, or raise it to silently invalidate a
+    /// proposal guardians had already legitimately brought to quorum. Callers
+    /// must `cancel_recovery` or wait for `execute_recovery` to consume the
+    /// proposal before calling this again. This does **not** affect
+    /// `add_guardian`/`remove_guardian`, which remain callable mid-recovery
+    /// per the existing issue #26 reconciliation logic.
+    ///
     /// # Errors
+    /// * [`WalletError::RecoveryConfigLocked`] — a `RecoveryProposal` is
+    ///   currently pending; cancel or execute it first.
     /// * [`WalletError::InvalidRecoveryThreshold`] — `threshold <= 1` (a
     ///   single guardian must never be able to unilaterally recover admin).
     /// * [`WalletError::NotEnoughGuardians`] — fewer than
@@ -578,6 +594,9 @@ impl GlobeWallet {
     ) -> Result<(), WalletError> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
+        if env.storage().instance().has(&DataKey::RecoveryProposal) {
+            return Err(WalletError::RecoveryConfigLocked);
+        }
         let guardians = Self::guardians(env.clone());
         if threshold <= 1 {
             return Err(WalletError::InvalidRecoveryThreshold);
@@ -643,6 +662,13 @@ impl GlobeWallet {
     ///
     /// Once approvals reach the configured threshold, the timelock is
     /// armed: `ready_at = current_ledger_sequence + delay_in_ledgers`.
+    ///
+    /// Since `set_recovery_config` refuses to run while a proposal is pending
+    /// (issue #28 / ADR-028-1), the `RecoveryConfig` read here is guaranteed
+    /// to be identical to the one active when `initiate_recovery` created this
+    /// proposal — reading it "live" is equivalent to reading a frozen snapshot
+    /// for the lifetime of the proposal. Do not weaken that guard without
+    /// re-deriving `threshold` from a value stored on the proposal itself.
     pub fn approve_recovery(env: Env, guardian: Address) -> Result<(), WalletError> {
         guardian.require_auth();
         Self::require_guardian(&env, &guardian)?;
@@ -729,7 +755,11 @@ impl GlobeWallet {
     /// `approve_recovery` time) in case a guardian revoked between quorum
     /// and timelock expiry in a way this contract didn't observe (defense in
     /// depth; `revoke_recovery_approval` already clears `ready_at`, but this
-    /// guards against any future code path that forgets to).
+    /// guards against any future code path that forgets to). This re-check is
+    /// belt-and-suspenders, not a live-config-tracking mechanism: per issue
+    /// #28 / ADR-028-1, `RecoveryConfig` cannot change at all while this
+    /// proposal exists, so `config.threshold` here is provably identical to
+    /// the value used by every prior `approve_recovery` call on this proposal.
     ///
     /// Any in-flight *normal* `propose_admin`/`accept_admin` transfer is
     /// cancelled as part of executing a recovery, so the two flows can't race.

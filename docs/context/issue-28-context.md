@@ -3,7 +3,7 @@
 > **Título:** `set_recovery_config` can be called mid-recovery with no guard or documented interaction
 > **Repo:** Orbit-Wal/contract · **Contrato:** `contracts/globe-wallet`
 > **Rama de trabajo:** `fix/issue-28`
-> **Estado:** � ADR definitivo aceptado (ADR-028-1, opción A) — pendiente de implementación y tests
+> **Estado:** 🟢 Guard `RecoveryConfigLocked` implementado en `set_recovery_config` — pendiente de tests (matriz §6)
 > **Última actualización:** 2026-08-26
 
 Este archivo es la fuente única de verdad (SSOT) para el trabajo sobre la
@@ -364,16 +364,55 @@ export PATH="$HOME/.cargo/bin:$PATH"
 ```
 antes de invocar `cargo`/`rustc` directamente en scripts o CI locales.
 
-## 8. Próximos pasos
+## 8. Estado de implementación
+
+Implementado en `contracts/globe-wallet/src/lib.rs` (commit siguiente a
+éste en la rama `fix/issue-28`), siguiendo al 100% la especificación de las
+secciones 3-4:
+
+- ✅ `WalletError::RecoveryConfigLocked = 1031` añadido al final del enum
+  `WalletError`, preservando el namespace contiguo `1001+` (siguiente al
+  último discriminante en uso, `UpgradeWasmNotUploaded = 1030`).
+- ✅ Guard añadido en `set_recovery_config`, inmediatamente después de
+  `require_admin` y **antes** de cualquier lectura de `guardians`/validación
+  de `threshold` y antes de cualquier escritura en storage: si existe
+  `DataKey::RecoveryProposal`, retorna `Err(WalletError::RecoveryConfigLocked)`
+  sin tocar `RecoveryConfig`.
+- ✅ Doc comments de `set_recovery_config`, `approve_recovery` y
+  `execute_recovery` actualizados con el texto exacto de la sección 4.
+- ✅ `cargo check -p globe-wallet` (perfil `dev`, sin `--all-targets`)
+  compila limpio: solo 2 warnings preexistentes y no relacionados
+  (`spec_xdr_transfer_admin` deprecado, `MAX_ASSETS` sin uso), sin
+  advertencias ni errores nuevos introducidos por este cambio.
+- ⚠️ **Bloqueador de entorno, no relacionado con este cambio:**
+  `cargo check --all-targets` / `cargo test` fallan al compilar
+  `soroban-env-host v21.2.1` (dependencia transitiva de
+  `soroban-sdk = 21.7.7` bajo el feature `testutils`) por un conflicto de
+  versiones entre `ed25519-dalek` y `rand_core`/`ChaCha20Rng`
+  (`the trait bound `ChaCha20Rng: ed25519_dalek::rand_core::CryptoRng`
+  is not satisfied`). Confirmado como **preexistente** (reproducido de
+  forma idéntica con `git stash`, es decir, sin los cambios de esta issue
+  aplicados) y causado por que `Cargo.lock` está en `.gitignore` — cada
+  checkout resuelve semver de forma independiente y puede escoger una
+  versión incompatible de `ed25519-dalek` para esa dependencia de test.
+  Fuera de alcance de la Issue #28; requiere su propia issue (pinear
+  `ed25519-dalek`/comprometer `Cargo.lock`, o actualizar `soroban-sdk`).
+  El código de producción del contrato (perfil sin `testutils`) no se ve
+  afectado, como confirma el `cargo check -p globe-wallet` limpio arriba.
+
+## 9. Próximos pasos
 
 1. ~~Validar con el equipo cuál de las opciones (A)/(B)/(C) se adopta~~ →
    **cerrado**: ADR-028-1 aceptado, opción A.
 2. Escribir los tests de la matriz de la sección 6 en modo *red* (deben
-   fallar contra el código actual, demostrando el bug).
-3. Implementar el guard `RecoveryConfigLocked` en `set_recovery_config`
-   con el discriminante `1031`, exactamente como se especifica en las
-   secciones 3 y 4 de este documento.
-4. Aplicar textualmente los doc comments de la sección 4 a
-   `set_recovery_config`, `approve_recovery` y `execute_recovery`.
-5. Verificar que los tests de la sección 6 pasan en verde y regenerar
-   solo los snapshots nuevos/afectados en `test_snapshots/tests/`.
+   fallar contra el código actual — ahora deben pasar en verde contra el
+   guard ya implementado en la sección 8).
+3. ~~Implementar el guard `RecoveryConfigLocked` en `set_recovery_config`~~
+   → **cerrado**, ver sección 8.
+4. ~~Aplicar textualmente los doc comments de la sección 4~~ → **cerrado**,
+   ver sección 8.
+5. Resolver el bloqueador de entorno de la sección 8 (drift de
+   `ed25519-dalek`) en una issue separada para poder ejecutar
+   `cargo test -p globe-wallet` end-to-end.
+6. Una vez resuelto el punto 5, ejecutar la matriz de la sección 6 y
+   regenerar solo los snapshots nuevos/afectados en `test_snapshots/tests/`.
