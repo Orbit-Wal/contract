@@ -179,6 +179,12 @@ pub enum WalletError {
     InvalidAssetInfo = 1029,
     /// Proposed wasm hash is not registered on-chain (never uploaded via upload_contract_wasm)
     UpgradeWasmNotUploaded = 1030,
+    /// `add_guardian` would exceed [`GlobeWallet::MAX_GUARDIANS`].
+    GuardianLimitExceeded = 1031,
+    /// `execute_recovery`'s proposal targets the same address that is
+    /// already the current admin — recovering "to" a no-op target is
+    /// rejected rather than silently succeeding as a wasted transfer.
+    RecoveryNewAdminUnchanged = 1032,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -192,6 +198,20 @@ impl GlobeWallet {
     /// threshold can be configured. Below this, "M-of-N social recovery"
     /// degenerates into "one or two people can unilaterally seize the wallet".
     const MIN_GUARDIANS_FOR_RECOVERY: u32 = 3;
+
+    /// Maximum guardians a wallet may register — mirrors [`Self::MAX_ASSETS`]'s
+    /// rationale but for storage-*mutation* cost rather than raw storage size
+    /// (see issue #27). `Guardians` (and its `GuardianMembership` index) lives
+    /// in *instance* storage, shared with every other piece of per-contract-
+    /// instance state (`Admin`, `PendingUpgrade`, `RecoveryConfig`,
+    /// `RecoveryProposal`, every `PendingAdmin(...)` entry). Every
+    /// `add_guardian`/`remove_guardian` call rewrites the *entire*
+    /// `Vec<Address>` under one key, so write cost grows with guardian count
+    /// on every single mutation, not just at read time. Real-world social-
+    /// recovery guardian sets are typically 5-9 people, so 15 leaves
+    /// comfortable headroom above any realistic threshold while keeping
+    /// per-call cost bounded and predictable.
+    pub const MAX_GUARDIANS: u32 = 15;
 
     /// Initialize the contract with an admin address.
     ///
@@ -418,6 +438,11 @@ impl GlobeWallet {
     //    stale countdown started earlier.
 
     /// Register a new guardian. Admin-authorized.
+    ///
+    /// # Errors
+    /// * [`WalletError::GuardianAlreadyAdded`]
+    /// * [`WalletError::GuardianLimitExceeded`] — would exceed
+    ///   [`Self::MAX_GUARDIANS`] (see issue #27).
     pub fn add_guardian(env: Env, admin: Address, guardian: Address) -> Result<(), WalletError> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
@@ -426,6 +451,9 @@ impl GlobeWallet {
             return Err(WalletError::GuardianAlreadyAdded);
         }
         let mut guardians = Self::guardians(env.clone());
+        if guardians.len() >= Self::MAX_GUARDIANS {
+            return Err(WalletError::GuardianLimitExceeded);
+        }
         guardians.push_back(guardian.clone());
         env.storage().instance().set(&DataKey::Guardians, &guardians);
         membership.set(guardian.clone(), true);
@@ -457,6 +485,19 @@ impl GlobeWallet {
     /// # Errors
     /// * [`WalletError::NotEnoughGuardians`] — would drop the guardian count
     ///   below the configured recovery threshold.
+    ///
+    /// ## Scan cost (issue #45)
+    /// This function's rebuild loop below, and `revoke_recovery_approval`'s
+    /// approval-list scan, remain O(n). `require_guardian` and
+    /// `add_guardian`'s duplicate check are *not* O(n) — both go through the
+    /// `GuardianMembership` map (see [`Self::guardian_membership`]) for an
+    /// O(1)-ish lookup instead of scanning the `Guardians` vector. Decision
+    /// recorded per #45's own framing: now that `MAX_GUARDIANS` (#27) bounds
+    /// guardian count to a small constant (15), the remaining O(n) rebuild
+    /// here is bounded-but-still-O(n) rather than unbounded, and is not
+    /// worth the added complexity of a `Map`-based rewrite of `Guardians`
+    /// itself (the ordered `Vec` is also the public enumeration API via
+    /// [`Self::guardians`], which a `Map` can't provide directly).
     pub fn remove_guardian(env: Env, admin: Address, guardian: Address) -> Result<(), WalletError> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
@@ -564,12 +605,29 @@ impl GlobeWallet {
     /// Configure (or reconfigure) the M-of-N recovery threshold and the
     /// post-quorum timelock delay. Admin-authorized.
     ///
+    /// ## Design decision: rejected while a recovery is pending (issue #28)
+    /// A `RecoveryProposal`'s `ready_at` is computed once, at the moment
+    /// quorum is reached in `approve_recovery`, and frozen into storage —
+    /// it does not retroactively track later `delay_in_ledgers` changes.
+    /// Meanwhile `execute_recovery`'s quorum check reads the *live*
+    /// `RecoveryConfig.threshold`, not the config in effect when quorum was
+    /// reached. That half-live, half-frozen coupling is confusing enough
+    /// (and undertested enough — see #28) that the safer design is to
+    /// disallow the ambiguity outright: while a `RecoveryProposal` exists,
+    /// `set_recovery_config` is rejected with [`WalletError::RecoveryAlreadyPending`].
+    /// An admin who wants to change the threshold/delay while a recovery is
+    /// in flight must first call `cancel_recovery` (if reachable) — the
+    /// already-existing, unambiguous way to stop a pending proposal — rather
+    /// than mutate config underneath it.
+    ///
     /// # Errors
     /// * [`WalletError::InvalidRecoveryThreshold`] — `threshold <= 1` (a
     ///   single guardian must never be able to unilaterally recover admin).
     /// * [`WalletError::NotEnoughGuardians`] — fewer than
     ///   [`Self::MIN_GUARDIANS_FOR_RECOVERY`] guardians registered, or
     ///   `threshold > guardians.len()`.
+    /// * [`WalletError::RecoveryAlreadyPending`] — a `RecoveryProposal` is
+    ///   currently in flight; call `cancel_recovery` first.
     pub fn set_recovery_config(
         env: Env,
         admin: Address,
@@ -578,6 +636,9 @@ impl GlobeWallet {
     ) -> Result<(), WalletError> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
+        if env.storage().instance().has(&DataKey::RecoveryProposal) {
+            return Err(WalletError::RecoveryAlreadyPending);
+        }
         let guardians = Self::guardians(env.clone());
         if threshold <= 1 {
             return Err(WalletError::InvalidRecoveryThreshold);
@@ -733,6 +794,14 @@ impl GlobeWallet {
     ///
     /// Any in-flight *normal* `propose_admin`/`accept_admin` transfer is
     /// cancelled as part of executing a recovery, so the two flows can't race.
+    ///
+    /// # Errors
+    /// * [`WalletError::RecoveryNewAdminUnchanged`] — the proposal's
+    ///   `new_admin` is identical to the current admin (see issue #42). This
+    ///   is a defense-in-depth sanity check, not a proof against a wrong
+    ///   target in general: `initiate_recovery` performs no on-chain
+    ///   validation of `new_admin` beyond this, so guardians remain the sole
+    ///   line of defense against a mistaken or malicious target address.
     pub fn execute_recovery(env: Env) -> Result<(), WalletError> {
         let config = Self::require_recovery_configured(&env)?;
         let proposal = Self::require_pending_recovery(&env)?;
@@ -748,6 +817,9 @@ impl GlobeWallet {
             .instance()
             .get(&DataKey::Admin)
             .ok_or(WalletError::NotInitialized)?;
+        if proposal.new_admin == old_admin {
+            return Err(WalletError::RecoveryNewAdminUnchanged);
+        }
         env.storage()
             .instance()
             .remove(&DataKey::PendingAdmin(old_admin.clone()));
@@ -1754,6 +1826,22 @@ mod tests {
     }
 
     #[test]
+    fn test_max_guardians_limit() {
+        // Regression test for issue #27: adding guardians up to the cap
+        // succeeds; the next one is rejected with a dedicated error, mirroring
+        // `test_max_assets_limit`'s coverage of `MAX_ASSETS`.
+        let (env, admin, guardians, client) = setup_with_guardians(GlobeWallet::MAX_GUARDIANS);
+        assert_eq!(guardians.len(), GlobeWallet::MAX_GUARDIANS);
+
+        let extra = Address::generate(&env);
+        assert_eq!(
+            client.try_add_guardian(&admin, &extra),
+            Err(Ok(WalletError::GuardianLimitExceeded))
+        );
+        assert_eq!(client.guardians().len(), GlobeWallet::MAX_GUARDIANS);
+    }
+
+    #[test]
     fn test_remove_guardian_below_threshold_fails() {
         let (_env, admin, guardians, client) = setup_with_guardians(3);
         client.set_recovery_config(&admin, &3u32, &10u32);
@@ -2081,6 +2169,93 @@ mod tests {
             client.try_accept_admin(&normal_candidate),
             Err(Ok(WalletError::NoPendingAdmin))
         );
+    }
+
+    #[test]
+    fn test_execute_recovery_rejects_new_admin_same_as_current_admin() {
+        // Regression test for issue #42: a recovery proposal that targets the
+        // already-current admin must be rejected at execute_recovery time
+        // rather than silently succeeding as a no-op transfer.
+        let (env, admin, guardians, client) = setup_with_guardians(3);
+        client.set_recovery_config(&admin, &2u32, &10u32);
+
+        client.initiate_recovery(&guardians.get(0).unwrap(), &admin);
+        client.approve_recovery(&guardians.get(1).unwrap());
+        env.ledger().with_mut(|l| l.sequence_number += 10);
+
+        assert_eq!(
+            client.try_execute_recovery(),
+            Err(Ok(WalletError::RecoveryNewAdminUnchanged))
+        );
+        assert_eq!(client.admin(), admin);
+        // The rejected proposal is left in place (execute_recovery is
+        // side-effect-free on this rejection path) so guardians/admin can
+        // still cancel it explicitly rather than it being silently consumed.
+        assert!(client.recovery_proposal().is_some());
+    }
+
+    #[test]
+    fn test_set_recovery_config_rejected_while_recovery_pending() {
+        // Regression test for issue #28: config changes mid-recovery are
+        // rejected outright rather than silently interacting with an
+        // in-flight proposal's frozen `ready_at` / live `threshold` check.
+        let (env, admin, guardians, client) = setup_with_guardians(3);
+        client.set_recovery_config(&admin, &2u32, &10u32);
+        let new_admin = Address::generate(&env);
+        client.initiate_recovery(&guardians.get(0).unwrap(), &new_admin);
+
+        assert_eq!(
+            client.try_set_recovery_config(&admin, &3u32, &5u32),
+            Err(Ok(WalletError::RecoveryAlreadyPending))
+        );
+
+        // Config is unchanged.
+        let config = client.recovery_config().unwrap();
+        assert_eq!(config.threshold, 2);
+        assert_eq!(config.delay_in_ledgers, 10);
+
+        // Cancelling the pending recovery unblocks reconfiguration again.
+        client.cancel_recovery(&admin);
+        client.set_recovery_config(&admin, &3u32, &5u32);
+        let config = client.recovery_config().unwrap();
+        assert_eq!(config.threshold, 3);
+        assert_eq!(config.delay_in_ledgers, 5);
+    }
+
+    #[test]
+    fn test_pending_admin_cleared_after_accept_admin() {
+        // Regression test for issue #44: after a normal admin transfer
+        // completes, `PendingAdmin(old_admin)` must not become orphaned
+        // garbage in instance storage — it must actually be removed, not
+        // merely superseded. `execute_recovery` already has an equivalent
+        // regression test (`test_recovery_clears_any_in_flight_normal_admin_transfer`);
+        // this covers the other (and more common) admin-rotation path.
+        let (env, cid, admin, client) = setup();
+        let candidate = Address::generate(&env);
+        client.propose_admin(&admin, &candidate);
+        env.as_contract(&cid, || {
+            assert!(env
+                .storage()
+                .instance()
+                .has(&DataKey::PendingAdmin(admin.clone())));
+        });
+
+        client.accept_admin(&candidate);
+        assert_eq!(client.admin(), candidate);
+        env.as_contract(&cid, || {
+            assert!(!env
+                .storage()
+                .instance()
+                .has(&DataKey::PendingAdmin(admin.clone())));
+        });
+
+        // Confirm it's genuinely gone, not just superseded: a fresh
+        // propose/accept cycle back to the old admin address must require
+        // its own fresh acceptance rather than resolving against any stale
+        // leftover entry keyed under that address.
+        client.propose_admin(&candidate, &admin);
+        client.accept_admin(&admin);
+        assert_eq!(client.admin(), admin);
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
