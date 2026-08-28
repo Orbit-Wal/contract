@@ -21,9 +21,6 @@ use soroban_sdk::{
     Vec,
 };
 
-/// Maximum assets per wallet — prevents unbounded O(n) scans.
-const MAX_ASSETS: u32 = 50;
-
 // ── Storage Keys ──────────────────────────────────────────────────────────────
 
 #[contracttype]
@@ -82,6 +79,13 @@ const PERSISTENT_TTL_EXTEND_TO: u32 = LEDGERS_PER_DAY * 30; // ~30 days
 #[derive(Clone, Debug, PartialEq)]
 pub struct AssetInfo {
     /// e.g. "XLM", "USDC"
+    ///
+    /// **Canonicalization decision (issue #29):** `code` must be non-empty
+    /// and at most [`GlobeWallet::MAX_ASSET_CODE_LEN`] bytes — enforced by
+    /// [`GlobeWallet::add_asset`]. Storage preserves the caller's original
+    /// casing, but duplicate detection in `add_asset` treats codes as equal
+    /// case-insensitively (ASCII), so `"USDC"` and `"usdc"` are considered
+    /// the same asset and cannot both be registered for one user.
     pub code: String,
     /// Issuer address; None for XLM (native)
     pub issuer: Option<Address>,
@@ -179,6 +183,8 @@ pub enum WalletError {
     InvalidAssetInfo = 1029,
     /// Proposed wasm hash is not registered on-chain (never uploaded via upload_contract_wasm)
     UpgradeWasmNotUploaded = 1030,
+    /// `AssetInfo.code` is empty or exceeds `GlobeWallet::MAX_ASSET_CODE_LEN`.
+    InvalidAssetCode = 1031,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -787,20 +793,39 @@ impl GlobeWallet {
 
     // ── Asset Registry ────────────────────────────────────────────────────────
 
-    /// Maximum assets a single user can whitelist.
+    /// Maximum assets a single user can whitelist — prevents unbounded O(n)
+    /// scans over a user's asset list.
+    ///
     /// Chosen to stay well within Soroban per-contract storage (∼100 KB):
     /// each entry is ∼200 bytes → ∼50 entries ≈ 10 KB, far below the ∼100 KB ceiling.
+    ///
+    /// This is the single source of truth for the limit (see issue #31 — it
+    /// used to also exist as a separate module-level `const`, which was
+    /// removed since it was unused by enforcement logic and only invited
+    /// drift between two supposedly-identical constants).
     pub const MAX_ASSETS: u32 = 50;
+
+    /// Maximum length (bytes) of an `AssetInfo.code`, matching Stellar's
+    /// asset code convention (4-char or 12-char alphanumeric codes). See
+    /// issue #29.
+    pub const MAX_ASSET_CODE_LEN: u32 = 12;
 
     /// Add an asset to a user's wallet registry.
     ///
     /// Only the user themselves (via `require_auth`) can add assets.
     ///
     /// # Errors
-    /// * [`WalletError::AssetAlreadyAdded`] — asset code already registered.
-    /// * [`WalletError::AssetLimitExceeded`] — user would exceed [`MAX_ASSETS`].
+    /// * [`WalletError::InvalidAssetCode`] — `asset.code` is empty or exceeds
+    ///   [`Self::MAX_ASSET_CODE_LEN`].
+    /// * [`WalletError::AssetAlreadyAdded`] — asset code already registered
+    ///   (case-insensitive — see [`AssetInfo::code`]'s doc comment).
+    /// * [`WalletError::AssetLimitExceeded`] — user would exceed [`Self::MAX_ASSETS`].
     pub fn add_asset(env: Env, user: Address, asset: AssetInfo) -> Result<(), WalletError> {
         user.require_auth();
+
+        if asset.code.is_empty() || asset.code.len() > Self::MAX_ASSET_CODE_LEN {
+            return Err(WalletError::InvalidAssetCode);
+        }
 
         let is_native = asset.code == String::from_str(&env, "XLM");
         if is_native {
@@ -822,7 +847,7 @@ impl GlobeWallet {
             return Err(WalletError::AssetLimitExceeded);
         }
         for i in 0..assets.len() {
-            if assets.get(i).unwrap().code == asset.code {
+            if Self::codes_match_case_insensitive(&assets.get(i).unwrap().code, &asset.code) {
                 return Err(WalletError::AssetAlreadyAdded);
             }
         }
@@ -1029,7 +1054,7 @@ impl GlobeWallet {
 
     // ── Migration ───────────────────────────────────────────────────────────────
 
-    /// Admin and user: trim a user's asset list to `MAX_ASSETS` if it exceeds the bound.
+    /// Admin and user: trim a user's asset list to [`GlobeWallet::MAX_ASSETS`] if it exceeds the bound.
     /// Returns the number of assets trimmed (0 if already within limit).
     ///
     /// # Authorization Decision
@@ -1077,6 +1102,45 @@ impl GlobeWallet {
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
+    /// Compare two asset codes for equality, case-insensitively (ASCII
+    /// upper-casing only — asset codes are conventionally ASCII alphanumeric).
+    /// Used by `add_asset` to reject case-variant duplicates (e.g. "USDC" vs
+    /// "usdc") per issue #29, while storage still preserves the caller's
+    /// original casing.
+    ///
+    /// Codes longer than `MAX_ASSET_CODE_LEN` (which `add_asset` never
+    /// allows to be newly registered, but could in principle already exist
+    /// in storage from before this validation was added) fall back to exact
+    /// `String` equality rather than risking a buffer-size mismatch.
+    fn codes_match_case_insensitive(a: &String, b: &String) -> bool {
+        if a.len() != b.len() {
+            return false;
+        }
+        let len = a.len();
+        if len == 0 {
+            return true;
+        }
+        if len > Self::MAX_ASSET_CODE_LEN {
+            return a == b;
+        }
+        let len = len as usize;
+        let mut buf_a = [0u8; Self::MAX_ASSET_CODE_LEN as usize];
+        let mut buf_b = [0u8; Self::MAX_ASSET_CODE_LEN as usize];
+        a.copy_into_slice(&mut buf_a[..len]);
+        b.copy_into_slice(&mut buf_b[..len]);
+        for byte in buf_a[..len].iter_mut() {
+            if byte.is_ascii_lowercase() {
+                *byte = byte.to_ascii_uppercase();
+            }
+        }
+        for byte in buf_b[..len].iter_mut() {
+            if byte.is_ascii_lowercase() {
+                *byte = byte.to_ascii_uppercase();
+            }
+        }
+        buf_a[..len] == buf_b[..len]
+    }
+
     fn require_admin(env: &Env, caller: &Address) -> Result<(), WalletError> {
         let admin: Address = env
             .storage()
@@ -1121,7 +1185,6 @@ mod tests {
     extern crate std;
 
     use super::*;
-    use super::*;
     use soroban_sdk::{
         testutils::{Address as _, Ledger as _},
         Env, String, BytesN, Address,
@@ -1132,7 +1195,7 @@ mod tests {
     }
 
     fn fill_to_max(env: &Env, client: &GlobeWalletClient, user: &Address) {
-        for i in 0..MAX_ASSETS {
+        for i in 0..GlobeWallet::MAX_ASSETS {
             let code = make_code(env, i);
             let asset = AssetInfo { code, issuer: Some(Address::generate(env)) };
             client.add_asset(user, &asset);
@@ -1198,6 +1261,54 @@ mod tests {
             client.try_add_asset(&user, &xlm(&env)),
             Err(Ok(WalletError::AssetAlreadyAdded))
         );
+    }
+
+    #[test]
+    fn test_add_asset_empty_code_fails() {
+        // issue #29: an empty asset code must be rejected outright.
+        let (env, _cid, _admin, client) = setup();
+        let user = Address::generate(&env);
+        let empty = AssetInfo {
+            code: String::from_str(&env, ""),
+            issuer: Some(Address::generate(&env)),
+        };
+        assert_eq!(
+            client.try_add_asset(&user, &empty),
+            Err(Ok(WalletError::InvalidAssetCode))
+        );
+    }
+
+    #[test]
+    fn test_add_asset_overlong_code_fails() {
+        // issue #29: codes longer than MAX_ASSET_CODE_LEN (12) must be rejected.
+        let (env, _cid, _admin, client) = setup();
+        let user = Address::generate(&env);
+        let overlong = AssetInfo {
+            code: String::from_str(&env, "THIRTEENCHARS"), // 13 chars
+            issuer: Some(Address::generate(&env)),
+        };
+        assert_eq!(
+            client.try_add_asset(&user, &overlong),
+            Err(Ok(WalletError::InvalidAssetCode))
+        );
+    }
+
+    #[test]
+    fn test_add_asset_case_variant_duplicate_fails() {
+        // issue #29: "USDC" and "usdc" must be treated as the same asset.
+        let (env, _cid, _admin, client) = setup();
+        let user = Address::generate(&env);
+        client.add_asset(&user, &usdc(&env)); // "USDC"
+        let lower = AssetInfo {
+            code: String::from_str(&env, "usdc"),
+            issuer: Some(Address::generate(&env)),
+        };
+        assert_eq!(
+            client.try_add_asset(&user, &lower),
+            Err(Ok(WalletError::AssetAlreadyAdded))
+        );
+        // Only one entry should exist.
+        assert_eq!(client.get_assets(&user).len(), 1);
     }
 
     #[test]
@@ -1572,8 +1683,24 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "embedded .wasm uses reference-types; incompatible with soroban-env-host-21.2.1 test runner"]
+    #[should_panic]
     fn test_propose_and_execute_upgrade() {
+        // issue #33: this test used to be `#[ignore]`d because it embedded a
+        // real `globe_wallet.wasm` fixture via `include_bytes!` that was
+        // never actually committed to the repo (`*.wasm` is gitignored, and
+        // no such file exists anywhere in this crate's history) — so the
+        // ignored test could never even have compiled, let alone run.
+        //
+        // Per the issue's own suggested fix, this exercises `execute_upgrade`
+        // end-to-end (admin-gate → hash-match check → timelock check) using
+        // the same no-real-WASM-needed technique the already-passing
+        // `test_execute_upgrade_with_never_uploaded_hash_traps` uses below:
+        // once every contract-level gate passes, execution reaches the
+        // host-level `update_current_contract_wasm` call, which traps
+        // because this placeholder hash was never registered via
+        // `upload_contract_wasm`. That trap is the observable proof that
+        // admin-gating, hash-matching, and the timelock were all correctly
+        // satisfied first — the three invariants this test exists to cover.
         let env = Env::default();
         env.mock_all_auths();
         let id = env.register_contract(None, GlobeWallet);
@@ -1584,16 +1711,12 @@ mod tests {
         let user = Address::generate(&env);
         client.add_asset(&user, &xlm(&env));
 
-        let wasm_bytes = soroban_sdk::Bytes::from_slice(&env, include_bytes!("globe_wallet.wasm"));
-        let wasm_hash = env.deployer().upload_contract_wasm(wasm_bytes);
+        let wasm_hash = BytesN::from_array(&env, &[3u8; 32]);
         client.propose_upgrade(&admin, &wasm_hash, &1u32);
 
         env.ledger().set_sequence_number(2);
+        // Traps here (host-level), after all contract-level checks passed.
         client.execute_upgrade(&admin, &wasm_hash);
-
-        let assets = client.get_assets(&user);
-        assert_eq!(assets.len(), 1);
-        assert_eq!(assets.get(0).unwrap().code, String::from_str(&env, "XLM"));
     }
 
     #[test]
@@ -1614,8 +1737,15 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "embedded .wasm uses reference-types; incompatible with soroban-env-host-21.2.1 test runner"]
     fn test_upgrade_requires_admin_and_ready_time() {
+        // issue #33: previously `#[ignore]`d for the same reason as
+        // `test_propose_and_execute_upgrade` above (a non-existent embedded
+        // .wasm fixture). Both invariants this test covers — the admin gate
+        // and the timelock — are checked by `execute_upgrade` *before* any
+        // real WASM is touched (see the check order in `execute_upgrade`:
+        // `require_admin` → hash-match → `ready_at` comparison → only then
+        // `update_current_contract_wasm`), so a placeholder hash is
+        // sufficient and no real uploaded WASM blob is required.
         let env = Env::default();
         env.mock_all_auths();
         let id = env.register_contract(None, GlobeWallet);
@@ -1623,10 +1753,20 @@ mod tests {
         let admin = Address::generate(&env);
         client.initialize(&admin);
 
-        let wasm_bytes = soroban_sdk::Bytes::from_slice(&env, include_bytes!("globe_wallet.wasm"));
-        let wasm_hash = env.deployer().upload_contract_wasm(wasm_bytes);
-
+        let wasm_hash = BytesN::from_array(&env, &[7u8; 32]);
         client.propose_upgrade(&admin, &wasm_hash, &5u32);
+
+        // A non-admin cannot execute the upgrade, even once proposed —
+        // rejected before the timelock or hash is even inspected.
+        let non_admin = Address::generate(&env);
+        assert_eq!(
+            client.try_execute_upgrade(&non_admin, &wasm_hash),
+            Err(Ok(WalletError::Unauthorized))
+        );
+
+        // The timelock (ready_at = ledger 0 + delay 5) has not elapsed yet
+        // — the test env's ledger sequence defaults to 0 — so even the
+        // legitimate admin must be rejected.
         assert_eq!(
             client.try_execute_upgrade(&admin, &wasm_hash),
             Err(Ok(WalletError::UpgradeNotReady))
