@@ -313,6 +313,50 @@ mod tests {
     }
 
     #[test]
+    fn test_transfer_from_rolls_back_allowance_when_underlying_transfer_fails() {
+        // issue #38: `transfer_from` persists the debited allowance *before*
+        // calling into the underlying token contract's `transfer`. If that
+        // underlying call itself fails (e.g. the owner's real balance is
+        // less than the amount being moved, even though it's within the
+        // allowance this contract tracks), Soroban's atomic transaction
+        // semantics roll back *all* state changes from the failed
+        // invocation, including the allowance write made earlier in the
+        // same call. This test locks in that expectation: the allowance
+        // read afterward must show the original, pre-attempt value, proving
+        // the storage write was rolled back rather than left partially
+        // applied.
+        let (env, _id, client) = setup();
+        let admin = Address::generate(&env);
+        let owner = Address::generate(&env);
+        let spender = Address::generate(&env);
+        let to = Address::generate(&env);
+        let (token_id, token_admin, token) = create_token_contract(&env, &admin);
+        // Owner has only 100 real tokens...
+        token_admin.mint(&owner, &100);
+
+        env.ledger().with_mut(|l| l.sequence_number = 100);
+        // ...but is approved for far more (500), so transfer_from's own
+        // allowance check passes and it proceeds to persist the debited
+        // allowance before calling the underlying token contract.
+        client.approve(&owner, &spender, &500, &200);
+
+        // Attempt to move 300 — passes the allowance check (500 >= 300) but
+        // exceeds the owner's real underlying balance (100), so the token
+        // contract's own `transfer` call fails.
+        assert!(client
+            .try_transfer_from(&spender, &token_id, &owner, &to, &300)
+            .is_err());
+
+        // The allowance must still read the ORIGINAL, pre-attempt value.
+        let a = client.allowance(&owner, &spender);
+        assert_eq!(a.amount, 500);
+        assert_eq!(a.expiry_ledger, 200);
+        // And no tokens actually moved.
+        assert_eq!(token.balance(&owner), 100);
+        assert_eq!(token.balance(&to), 0);
+    }
+
+    #[test]
     fn test_transfer_from_succeeds_exactly_at_expiry_ledger() {
         let (env, _id, client) = setup();
         let admin = Address::generate(&env);
