@@ -421,6 +421,23 @@ impl GlobeWallet {
         Ok(())
     }
 
+    /// Cancel the current pending upgrade proposal.
+    ///
+    /// # Errors
+    /// * [`WalletError::Unauthorized`] — caller is not the current admin
+    /// * [`WalletError::UpgradeNotPending`] — no upgrade proposal is currently queued
+    pub fn cancel_upgrade(env: Env, admin: Address) -> Result<(), WalletError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        if !env.storage().instance().has(&DataKey::PendingUpgrade) {
+            return Err(WalletError::UpgradeNotPending);
+        }
+        env.storage().instance().remove(&DataKey::PendingUpgrade);
+        env.events()
+            .publish((Symbol::new(&env, "upgrade_cancelled"),), admin);
+        Ok(())
+    }
+
     // ── Guardian-Based Admin Recovery ────────────────────────────────────────
     //
     // See `https://github.com/Orbit-Wal/mobile/blob/main/docs/design/recovery/RECOVERY.md`
@@ -800,6 +817,9 @@ impl GlobeWallet {
     ///
     /// Any in-flight *normal* `propose_admin`/`accept_admin` transfer is
     /// cancelled as part of executing a recovery, so the two flows can't race.
+    /// Likewise, any in-flight `PendingUpgrade` proposed by the outgoing
+    /// admin is cleared so a compromised key cannot leave a malicious upgrade
+    /// queued or permanently block future upgrade proposals for the new admin.
     ///
     /// # Errors
     /// * [`WalletError::RecoveryNewAdminUnchanged`] — the proposal's
@@ -829,6 +849,7 @@ impl GlobeWallet {
         env.storage()
             .instance()
             .remove(&DataKey::PendingAdmin(old_admin.clone()));
+        env.storage().instance().remove(&DataKey::PendingUpgrade);
         env.storage()
             .instance()
             .set(&DataKey::Admin, &proposal.new_admin);
@@ -1672,12 +1693,15 @@ mod tests {
         let user = Address::generate(&env);
         for i in 0..GlobeWallet::MAX_ASSETS {
             let code = String::from_str(&env, &std::format!("ASSET{}", i));
-            let asset = AssetInfo { code, issuer: None };
+            let asset = AssetInfo {
+                code,
+                issuer: Some(Address::generate(&env)),
+            };
             client.add_asset(&user, &asset);
         }
         let extra = AssetInfo {
             code: String::from_str(&env, "EXTRA"),
-            issuer: None,
+            issuer: Some(Address::generate(&env)),
         };
         assert_eq!(
             client.try_add_asset(&user, &extra),
@@ -1692,7 +1716,10 @@ mod tests {
         let mut assets: Vec<AssetInfo> = Vec::new(&env);
         for i in 0..GlobeWallet::MAX_ASSETS + 10 {
             let code = String::from_str(&env, &std::format!("ASSET{}", i));
-            assets.push_back(AssetInfo { code: code.clone(), issuer: None });
+            assets.push_back(AssetInfo {
+                code: code.clone(),
+                issuer: Some(Address::generate(&env)),
+            });
         }
         env.as_contract(&cid, || {
             env.storage()
@@ -1734,7 +1761,10 @@ mod tests {
         let user = Address::generate(&env);
         for i in 0..3 {
             let code = String::from_str(&env, &std::format!("ASSET{}", i));
-            let asset = AssetInfo { code, issuer: None };
+            let asset = AssetInfo {
+                code,
+                issuer: Some(Address::generate(&env)),
+            };
             client.add_asset(&user, &asset);
         }
         let removed = client.migrate_user_assets(&admin, &user);
@@ -1881,7 +1911,7 @@ mod tests {
         let never_uploaded_hash = BytesN::from_array(&env, &[42u8; 32]);
 
         // propose_upgrade should succeed even with an invalid hash
-        assert_eq!(client.try_propose_upgrade(&admin, &never_uploaded_hash, &0u32), Ok(()));
+        assert_eq!(client.try_propose_upgrade(&admin, &never_uploaded_hash, &0u32), Ok(Ok(())));
 
         // The proposal is stored
         let cid = id.clone();
@@ -1920,6 +1950,135 @@ mod tests {
         // was never uploaded via upload_contract_wasm. The test is marked
         // #[should_panic] to capture that behavior.
         client.execute_upgrade(&admin, &never_uploaded_hash);
+    }
+
+    #[test]
+    fn test_cancel_upgrade() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register_contract(None, GlobeWallet);
+        let client = GlobeWalletClient::new(&env, &id);
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        let wasm_hash = BytesN::from_array(&env, &[11u8; 32]);
+        client.propose_upgrade(&admin, &wasm_hash, &10u32);
+
+        // Cancel the pending upgrade.
+        assert_eq!(client.try_cancel_upgrade(&admin), Ok(Ok(())));
+
+        // Upgrade is no longer pending.
+        assert_eq!(
+            client.try_execute_upgrade(&admin, &wasm_hash),
+            Err(Ok(WalletError::UpgradeNotPending))
+        );
+
+        // Cancelling again fails with UpgradeNotPending.
+        assert_eq!(
+            client.try_cancel_upgrade(&admin),
+            Err(Ok(WalletError::UpgradeNotPending))
+        );
+
+        // Admin can propose a new upgrade now.
+        let new_hash = BytesN::from_array(&env, &[22u8; 32]);
+        assert_eq!(
+            client.try_propose_upgrade(&admin, &new_hash, &5u32),
+            Ok(Ok(()))
+        );
+    }
+
+    #[test]
+    fn test_cancel_upgrade_requires_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register_contract(None, GlobeWallet);
+        let client = GlobeWalletClient::new(&env, &id);
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        let wasm_hash = BytesN::from_array(&env, &[11u8; 32]);
+        client.propose_upgrade(&admin, &wasm_hash, &10u32);
+
+        let non_admin = Address::generate(&env);
+        assert_eq!(
+            client.try_cancel_upgrade(&non_admin),
+            Err(Ok(WalletError::Unauthorized))
+        );
+    }
+
+    #[test]
+    fn test_cancel_upgrade_not_pending_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register_contract(None, GlobeWallet);
+        let client = GlobeWalletClient::new(&env, &id);
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        assert_eq!(
+            client.try_cancel_upgrade(&admin),
+            Err(Ok(WalletError::UpgradeNotPending))
+        );
+    }
+
+    #[test]
+    fn test_stale_upgrade_cleared_by_new_admin_via_cancel_upgrade() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register_contract(None, GlobeWallet);
+        let client = GlobeWalletClient::new(&env, &id);
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        // Old admin proposes an upgrade
+        let malicious_hash = BytesN::from_array(&env, &[0xEEu8; 32]);
+        client.propose_upgrade(&admin, &malicious_hash, &10u32);
+
+        // Admin transferred to new admin
+        let new_admin = Address::generate(&env);
+        client.propose_admin(&admin, &new_admin);
+        client.accept_admin(&new_admin);
+        assert_eq!(client.admin(), new_admin);
+
+        // New admin clears the stale upgrade proposal via cancel_upgrade
+        assert_eq!(client.try_cancel_upgrade(&new_admin), Ok(Ok(())));
+
+        // New admin can propose a legitimate upgrade
+        let real_hash = BytesN::from_array(&env, &[0x11u8; 32]);
+        assert_eq!(
+            client.try_propose_upgrade(&new_admin, &real_hash, &100u32),
+            Ok(Ok(()))
+        );
+    }
+
+    #[test]
+    fn test_recovery_clears_pending_upgrade_and_unblocks_future_proposals() {
+        let (env, admin, guardians, client) = setup_with_guardians(3);
+        client.set_recovery_config(&admin, &2u32, &10u32);
+
+        // Compromised admin proposes a malicious upgrade.
+        let malicious_hash = BytesN::from_array(&env, &[0xEEu8; 32]);
+        client.propose_upgrade(&admin, &malicious_hash, &1u32);
+
+        // Guardians successfully recover to a trusted new admin.
+        let new_admin = Address::generate(&env);
+        client.initiate_recovery(&guardians.get(0).unwrap(), &new_admin);
+        client.approve_recovery(&guardians.get(1).unwrap());
+        env.ledger().with_mut(|l| l.sequence_number += 20);
+        client.execute_recovery();
+        assert_eq!(client.admin(), new_admin);
+
+        // Verify execute_recovery cleared PendingUpgrade automatically:
+        // 1. Trying to execute the malicious upgrade returns UpgradeNotPending
+        assert_eq!(
+            client.try_execute_upgrade(&new_admin, &malicious_hash),
+            Err(Ok(WalletError::UpgradeNotPending))
+        );
+
+        // 2. The new, legitimate admin can propose a real upgrade (no longer blocked by UpgradeAlreadyPending)
+        let real_hash = BytesN::from_array(&env, &[0x11u8; 32]);
+        let result = client.try_propose_upgrade(&new_admin, &real_hash, &100u32);
+        assert_eq!(result, Ok(Ok(())));
     }
 
     // ── Guardian Recovery ─────────────────────────────────────────────────
@@ -2580,10 +2739,15 @@ mod tests {
 
     #[test]
     fn test_user_assets_ttl_extension_after_long_idle_period() {
-        let (env, _cid, _admin, client) = setup();
+        let (env, cid, _admin, client) = setup();
         let user = Address::generate(&env);
         client.add_asset(&user, &xlm(&env));
         client.add_asset(&user, &usdc(&env));
+
+        // Extend contract instance TTL so the contract itself remains alive during the idle jump.
+        env.as_contract(&cid, || {
+            env.storage().instance().extend_ttl(50_000, 100_000);
+        });
 
         // Jump well past the default persistent-entry TTL (4096 ledgers).
         // Without extend_ttl, the entry's default TTL would have expired
@@ -2597,10 +2761,15 @@ mod tests {
 
     #[test]
     fn test_spend_limit_ttl_extension_after_long_idle_period() {
-        let (env, _cid, _admin, client) = setup();
+        let (env, cid, _admin, client) = setup();
         let user = Address::generate(&env);
         let code = String::from_str(&env, "XLM");
         client.set_spend_limit(&user, &code, &1_000_000_i128);
+
+        // Extend contract instance TTL so the contract itself remains alive during the idle jump.
+        env.as_contract(&cid, || {
+            env.storage().instance().extend_ttl(50_000, 100_000);
+        });
 
         // Jump well past default persistent-entry TTL.
         env.ledger().with_mut(|l| l.sequence_number += 50_000);

@@ -209,6 +209,43 @@
                         "key": {
                           "vec": [
                             {
+                              "symbol": "GuardianMembership"
+                            }
+                          ]
+                        },
+                        "val": {
+                          "map": [
+                            {
+                              "key": {
+                                "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
+                              },
+                              "val": {
+                                "bool": true
+                              }
+                            },
+                            {
+                              "key": {
+                                "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
+                              },
+                              "val": {
+                                "bool": true
+                              }
+                            },
+                            {
+                              "key": {
+                                "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
+                              },
+                              "val": {
+                                "bool": true
+                              }
+                            }
+                          ]
+                        }
+                      },
+                      {
+                        "key": {
+                          "vec": [
+                            {
                               "symbol": "Guardians"
                             }
                           ]
@@ -1222,7 +1259,7 @@
             ],
             "data": {
               "error": {
-                "contract": 24
+                "contract": 1024
               }
             }
           }
@@ -1243,7 +1280,7 @@
               },
               {
                 "error": {
-                  "contract": 24
+                  "contract": 1024
                 }
               }
             ],
@@ -1268,7 +1305,7 @@
               },
               {
                 "error": {
-                  "contract": 24
+                  "contract": 1024
                 }
               }
             ],

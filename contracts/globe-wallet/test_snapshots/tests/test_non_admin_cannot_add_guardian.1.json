@@ -78,6 +78,27 @@
                         "key": {
                           "vec": [
                             {
+                              "symbol": "GuardianMembership"
+                            }
+                          ]
+                        },
+                        "val": {
+                          "map": [
+                            {
+                              "key": {
+                                "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
+                              },
+                              "val": {
+                                "bool": true
+                              }
+                            }
+                          ]
+                        }
+                      },
+                      {
+                        "key": {
+                          "vec": [
+                            {
                               "symbol": "Guardians"
                             }
                           ]
@@ -348,7 +369,7 @@
             ],
             "data": {
               "error": {
-                "contract": 3
+                "contract": 1003
               }
             }
           }
@@ -369,7 +390,7 @@
               },
               {
                 "error": {
-                  "contract": 3
+                  "contract": 1003
                 }
               }
             ],
@@ -394,7 +415,7 @@
               },
               {
                 "error": {
-                  "contract": 3
+                  "contract": 1003
                 }
               }
             ],
