@@ -32,6 +32,7 @@ fn two_spends_in_one_host_invocation_accumulate() {
     let user = Address::generate(&env);
     let asset_code = String::from_str(&env, "XLM");
 
+    wallet.add_asset(&user, &globe_wallet::AssetInfo { code: asset_code.clone(), issuer: None });
     wallet.set_spend_limit(&user, &asset_code, &1_000_i128);
 
     // Both calls share one root host invocation. The second call must observe
