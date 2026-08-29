@@ -80,12 +80,12 @@ const PERSISTENT_TTL_EXTEND_TO: u32 = LEDGERS_PER_DAY * 30; // ~30 days
 pub struct AssetInfo {
     /// e.g. "XLM", "USDC"
     ///
-    /// **Canonicalization decision (issue #29):** `code` must be non-empty
+    /// **Canonicalization decision (issue #29, #93):** `code` must be non-empty
     /// and at most [`GlobeWallet::MAX_ASSET_CODE_LEN`] bytes — enforced by
     /// [`GlobeWallet::add_asset`]. Storage preserves the caller's original
-    /// casing, but duplicate detection in `add_asset` treats codes as equal
-    /// case-insensitively (ASCII), so `"USDC"` and `"usdc"` are considered
-    /// the same asset and cannot both be registered for one user.
+    /// casing, but duplicate detection in `add_asset` and lookup in `remove_asset`
+    /// treat codes as equal case-insensitively (ASCII), so `"USDC"` and `"usdc"`
+    /// are considered the same asset.
     pub code: String,
     /// Issuer address; None for XLM (native)
     pub issuer: Option<Address>,
@@ -939,8 +939,11 @@ impl GlobeWallet {
 
     /// Remove an asset from a user's wallet registry.
     ///
+    /// Asset code matching is case-insensitive (ASCII), matching `add_asset`'s
+    /// duplicate detection rule.
+    ///
     /// # Errors
-    /// * [`WalletError::AssetNotFound`] — asset code not registered.
+    /// * [`WalletError::AssetNotFound`] — asset code not registered under any casing.
     pub fn remove_asset(env: Env, user: Address, asset_code: String) -> Result<(), WalletError> {
         user.require_auth();
         let assets: Vec<AssetInfo> = env
@@ -952,7 +955,7 @@ impl GlobeWallet {
         let mut found = false;
         for i in 0..assets.len() {
             let a = assets.get(i).unwrap();
-            if a.code == asset_code {
+            if Self::codes_match_case_insensitive(&a.code, &asset_code) {
                 found = true;
             } else {
                 new_assets.push_back(a);
@@ -1177,8 +1180,8 @@ impl GlobeWallet {
     /// Compare two asset codes for equality, case-insensitively (ASCII
     /// upper-casing only — asset codes are conventionally ASCII alphanumeric).
     /// Used by `add_asset` to reject case-variant duplicates (e.g. "USDC" vs
-    /// "usdc") per issue #29, while storage still preserves the caller's
-    /// original casing.
+    /// "usdc") per issue #29 and `remove_asset` for case-insensitive lookup
+    /// per issue #93, while storage still preserves the caller's original casing.
     ///
     /// Codes longer than `MAX_ASSET_CODE_LEN` (which `add_asset` never
     /// allows to be newly registered, but could in principle already exist
@@ -1396,6 +1399,46 @@ mod tests {
     }
 
     #[test]
+    fn test_remove_asset_case_mismatch_succeeds() {
+        let (env, _cid, _admin, client) = setup();
+        let user = Address::generate(&env);
+        client.add_asset(&user, &usdc(&env)); // registers "USDC"
+
+        // Passing a lowercase code "usdc" successfully finds and removes "USDC"
+        let result = client.try_remove_asset(&user, &String::from_str(&env, "usdc"));
+        assert_eq!(result, Ok(Ok(())));
+        assert_eq!(client.get_assets(&user).len(), 0);
+    }
+
+    #[test]
+    fn test_remove_asset_case_variants() {
+        let (env, _cid, _admin, client) = setup();
+        let user = Address::generate(&env);
+
+        // Mixed-case removal of uppercase registered asset
+        client.add_asset(&user, &usdc(&env)); // "USDC"
+        client.remove_asset(&user, &String::from_str(&env, "uSdC"));
+        assert_eq!(client.get_assets(&user).len(), 0);
+
+        // Uppercase removal of lowercase registered asset
+        let lower_asset = AssetInfo {
+            code: String::from_str(&env, "eurc"),
+            issuer: Some(Address::generate(&env)),
+        };
+        client.add_asset(&user, &lower_asset);
+        client.remove_asset(&user, &String::from_str(&env, "EURC"));
+        assert_eq!(client.get_assets(&user).len(), 0);
+
+        // Native XLM removed via lowercase
+        client.add_asset(&user, &xlm(&env));
+        client.add_asset(&user, &usdc(&env));
+        client.remove_asset(&user, &String::from_str(&env, "xlm"));
+        let assets = client.get_assets(&user);
+        assert_eq!(assets.len(), 1);
+        assert_eq!(assets.get(0).unwrap().code, String::from_str(&env, "USDC"));
+    }
+
+    #[test]
     fn test_remove_nonexistent_asset_fails() {
         let (env, _cid, _admin, client) = setup();
         let user = Address::generate(&env);
@@ -1403,6 +1446,43 @@ mod tests {
             client.try_remove_asset(&user, &String::from_str(&env, "XLM")),
             Err(Ok(WalletError::AssetNotFound))
         );
+    }
+
+    #[test]
+    fn test_remove_asset_genuinely_absent_fails_all_casings() {
+        let (env, _cid, _admin, client) = setup();
+        let user = Address::generate(&env);
+        client.add_asset(&user, &usdc(&env)); // only "USDC" registered
+
+        // Different assets in various casings fail with AssetNotFound
+        assert_eq!(
+            client.try_remove_asset(&user, &String::from_str(&env, "ETH")),
+            Err(Ok(WalletError::AssetNotFound))
+        );
+        assert_eq!(
+            client.try_remove_asset(&user, &String::from_str(&env, "eth")),
+            Err(Ok(WalletError::AssetNotFound))
+        );
+        assert_eq!(
+            client.try_remove_asset(&user, &String::from_str(&env, "Eth")),
+            Err(Ok(WalletError::AssetNotFound))
+        );
+        // Prefix / substring matches must not falsely match
+        assert_eq!(
+            client.try_remove_asset(&user, &String::from_str(&env, "USD")),
+            Err(Ok(WalletError::AssetNotFound))
+        );
+        assert_eq!(
+            client.try_remove_asset(&user, &String::from_str(&env, "usd")),
+            Err(Ok(WalletError::AssetNotFound))
+        );
+        assert_eq!(
+            client.try_remove_asset(&user, &String::from_str(&env, "USDCX")),
+            Err(Ok(WalletError::AssetNotFound))
+        );
+
+        // Original asset still remains untouched
+        assert_eq!(client.get_assets(&user).len(), 1);
     }
 
     #[test]
