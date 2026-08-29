@@ -833,12 +833,17 @@ impl GlobeWallet {
             .instance()
             .set(&DataKey::Admin, &proposal.new_admin);
         env.storage().instance().remove(&DataKey::RecoveryProposal);
-        // Same event name/shape as a normal transfer: downstream indexers
-        // and the mobile app don't need to special-case recovery-driven
-        // admin changes.
+        // Retain existing admin_transferred event for backward compatibility so
+        // downstream indexers and mobile app clients do not break.
         env.events().publish(
             (Symbol::new(&env, "admin_transferred"),),
-            (old_admin, proposal.new_admin),
+            (old_admin.clone(), proposal.new_admin.clone()),
+        );
+        // Also emit a distinct recovery_executed event carrying full recovery context
+        // (old admin, new admin, approving guardians) for security monitoring and alerting (issue #91).
+        env.events().publish(
+            (Symbol::new(&env, "recovery_executed"),),
+            (old_admin, proposal.new_admin, proposal.approvals),
         );
         Ok(())
     }
@@ -1258,8 +1263,8 @@ mod tests {
 
     use super::*;
     use soroban_sdk::{
-        testutils::{Address as _, Ledger as _},
-        Env, String, BytesN, Address,
+        testutils::{Address as _, Events as _, Ledger as _},
+        Env, String, BytesN, Address, Symbol, TryFromVal, Vec,
     };
 
     fn make_code(env: &Env, n: u32) -> String {
@@ -1672,12 +1677,15 @@ mod tests {
         let user = Address::generate(&env);
         for i in 0..GlobeWallet::MAX_ASSETS {
             let code = String::from_str(&env, &std::format!("ASSET{}", i));
-            let asset = AssetInfo { code, issuer: None };
+            let asset = AssetInfo {
+                code,
+                issuer: Some(Address::generate(&env)),
+            };
             client.add_asset(&user, &asset);
         }
         let extra = AssetInfo {
             code: String::from_str(&env, "EXTRA"),
-            issuer: None,
+            issuer: Some(Address::generate(&env)),
         };
         assert_eq!(
             client.try_add_asset(&user, &extra),
@@ -1692,7 +1700,10 @@ mod tests {
         let mut assets: Vec<AssetInfo> = Vec::new(&env);
         for i in 0..GlobeWallet::MAX_ASSETS + 10 {
             let code = String::from_str(&env, &std::format!("ASSET{}", i));
-            assets.push_back(AssetInfo { code: code.clone(), issuer: None });
+            assets.push_back(AssetInfo {
+                code: code.clone(),
+                issuer: Some(Address::generate(&env)),
+            });
         }
         env.as_contract(&cid, || {
             env.storage()
@@ -1734,7 +1745,10 @@ mod tests {
         let user = Address::generate(&env);
         for i in 0..3 {
             let code = String::from_str(&env, &std::format!("ASSET{}", i));
-            let asset = AssetInfo { code, issuer: None };
+            let asset = AssetInfo {
+                code,
+                issuer: Some(Address::generate(&env)),
+            };
             client.add_asset(&user, &asset);
         }
         let removed = client.migrate_user_assets(&admin, &user);
@@ -1881,7 +1895,7 @@ mod tests {
         let never_uploaded_hash = BytesN::from_array(&env, &[42u8; 32]);
 
         // propose_upgrade should succeed even with an invalid hash
-        assert_eq!(client.try_propose_upgrade(&admin, &never_uploaded_hash, &0u32), Ok(()));
+        assert_eq!(client.try_propose_upgrade(&admin, &never_uploaded_hash, &0u32), Ok(Ok(())));
 
         // The proposal is stored
         let cid = id.clone();
@@ -2197,6 +2211,96 @@ mod tests {
         client.execute_recovery();
         assert_eq!(client.admin(), new_admin);
         assert!(client.recovery_proposal().is_none());
+    }
+
+    #[test]
+    fn test_execute_recovery_emits_both_admin_transferred_and_recovery_executed_events() {
+        let (env, cid, admin, client) = setup();
+        let g0 = Address::generate(&env);
+        let g1 = Address::generate(&env);
+        let g2 = Address::generate(&env);
+        client.add_guardian(&admin, &g0);
+        client.add_guardian(&admin, &g1);
+        client.add_guardian(&admin, &g2);
+        client.set_recovery_config(&admin, &2u32, &10u32);
+
+        let new_admin = Address::generate(&env);
+        client.initiate_recovery(&g0, &new_admin);
+        client.approve_recovery(&g1);
+
+        env.ledger().with_mut(|l| l.sequence_number += 10);
+        let events_before_len = env.events().all().len();
+
+        client.execute_recovery();
+
+        assert_eq!(client.admin(), new_admin);
+
+        let all_events = env.events().all();
+        assert_eq!(all_events.len(), events_before_len + 2);
+
+        let mut expected_approvals = Vec::new(&env);
+        expected_approvals.push_back(g0.clone());
+        expected_approvals.push_back(g1.clone());
+
+        // Event 1: admin_transferred (backward compatibility)
+        let event_admin_transferred = all_events.get(events_before_len).unwrap();
+        assert_eq!(event_admin_transferred.0, cid);
+        assert_eq!(event_admin_transferred.1.len(), 1);
+        let topic1: Symbol = Symbol::try_from_val(&env, &event_admin_transferred.1.get(0).unwrap()).unwrap();
+        assert_eq!(topic1, Symbol::new(&env, "admin_transferred"));
+        let (old1, new1): (Address, Address) =
+            TryFromVal::try_from_val(&env, &event_admin_transferred.2).unwrap();
+        assert_eq!(old1, admin);
+        assert_eq!(new1, new_admin);
+
+        // Event 2: recovery_executed (emergency recovery context for monitoring)
+        let event_recovery_executed = all_events.get(events_before_len + 1).unwrap();
+        assert_eq!(event_recovery_executed.0, cid);
+        assert_eq!(event_recovery_executed.1.len(), 1);
+        let topic2: Symbol = Symbol::try_from_val(&env, &event_recovery_executed.1.get(0).unwrap()).unwrap();
+        assert_eq!(topic2, Symbol::new(&env, "recovery_executed"));
+        let (old2, new2, approvals2): (Address, Address, Vec<Address>) =
+            TryFromVal::try_from_val(&env, &event_recovery_executed.2).unwrap();
+        assert_eq!(old2, admin);
+        assert_eq!(new2, new_admin);
+        assert_eq!(approvals2, expected_approvals);
+    }
+
+    #[test]
+    fn test_accept_admin_routine_transfer_emits_only_admin_transferred_event() {
+        let (env, cid, admin, client) = setup();
+        let candidate = Address::generate(&env);
+
+        client.propose_admin(&admin, &candidate);
+        let events_before_len = env.events().all().len();
+
+        client.accept_admin(&candidate);
+        assert_eq!(client.admin(), candidate);
+
+        let all_events = env.events().all();
+        // accept_admin emits exactly 1 event: admin_transferred
+        assert_eq!(all_events.len(), events_before_len + 1);
+
+        let event = all_events.get(events_before_len).unwrap();
+        assert_eq!(event.0, cid);
+        assert_eq!(event.1.len(), 1);
+        let topic: Symbol = Symbol::try_from_val(&env, &event.1.get(0).unwrap()).unwrap();
+        assert_eq!(topic, Symbol::new(&env, "admin_transferred"));
+        let (old, new): (Address, Address) =
+            TryFromVal::try_from_val(&env, &event.2).unwrap();
+        assert_eq!(old, admin);
+        assert_eq!(new, candidate);
+
+        // Verify that no recovery_executed event was published anywhere in the test
+        let recovery_sym = Symbol::new(&env, "recovery_executed");
+        for i in 0..all_events.len() {
+            let ev = all_events.get(i).unwrap();
+            for j in 0..ev.1.len() {
+                if let Ok(sym) = Symbol::try_from_val(&env, &ev.1.get(j).unwrap()) {
+                    assert_ne!(sym, recovery_sym);
+                }
+            }
+        }
     }
 
     #[test]
@@ -2580,10 +2684,17 @@ mod tests {
 
     #[test]
     fn test_user_assets_ttl_extension_after_long_idle_period() {
-        let (env, _cid, _admin, client) = setup();
+        let (env, cid, _admin, client) = setup();
         let user = Address::generate(&env);
         client.add_asset(&user, &xlm(&env));
         client.add_asset(&user, &usdc(&env));
+
+        // Keep contract instance alive so only the persistent entry TTL is under test
+        env.as_contract(&cid, || {
+            env.storage()
+                .instance()
+                .extend_ttl(PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND_TO);
+        });
 
         // Jump well past the default persistent-entry TTL (4096 ledgers).
         // Without extend_ttl, the entry's default TTL would have expired
@@ -2597,10 +2708,18 @@ mod tests {
 
     #[test]
     fn test_spend_limit_ttl_extension_after_long_idle_period() {
-        let (env, _cid, _admin, client) = setup();
+        let (env, cid, _admin, client) = setup();
         let user = Address::generate(&env);
+        client.add_asset(&user, &xlm(&env));
         let code = String::from_str(&env, "XLM");
         client.set_spend_limit(&user, &code, &1_000_000_i128);
+
+        // Keep contract instance alive so only the persistent entry TTL is under test
+        env.as_contract(&cid, || {
+            env.storage()
+                .instance()
+                .extend_ttl(PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND_TO);
+        });
 
         // Jump well past default persistent-entry TTL.
         env.ledger().with_mut(|l| l.sequence_number += 50_000);
