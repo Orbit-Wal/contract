@@ -128,6 +128,53 @@ pub struct RecoveryProposal {
     pub ready_at: Option<u32>,
 }
 
+/// Payload of the `recovery_completed` event `execute_recovery` publishes
+/// (see issue #91). Every other event in this contract is a raw tuple —
+/// this one is deliberately a named `#[contracttype]` struct instead, and
+/// that's a one-off departure worth explaining rather than a stylistic
+/// accident: a tuple's fields are positional and undocumented in the
+/// on-chain XDR itself, which is a tolerable ergonomics trade-off for a
+/// 2-3 field payload where order is obvious from context. This event has
+/// five fields feeding a security-alerting integration, where a
+/// transposed pair of `Address`es (e.g. an indexer reading `new_admin`
+/// where `old_admin` belongs) has real consequences — it would misreport
+/// *who just lost control of a wallet* during exactly the incident that
+/// most needs to be reported correctly. A named struct makes every field
+/// self-describing in the XDR, independent of any off-chain schema the
+/// reader has to already know and keep in sync by hand. The cost is
+/// inconsistency with this contract's existing tuple-event convention;
+/// the recommendation, not executed here to keep this PR's diff scoped to
+/// issue #91, is to migrate the other multi-field events to the same
+/// pattern in a follow-up rather than let this be the one place it's used.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct RecoveryCompletedEvent {
+    /// Admin address in control immediately before this recovery.
+    pub old_admin: Address,
+    /// Admin address the guardians recovered control to.
+    pub new_admin: Address,
+    /// Every guardian whose approval is on the executed proposal — not
+    /// just the `threshold` minimum. A recovery ratified 5-of-5 and one
+    /// ratified 3-of-5 (with `threshold == 3`) are different-risk events
+    /// even though both satisfy the same on-chain quorum check; an
+    /// alerting integration that only knows "quorum was reached" can't
+    /// tell them apart, this field lets it.
+    pub approving_guardians: Vec<Address>,
+    /// `RecoveryConfig.threshold` in effect for this execution — the
+    /// minimum quorum size, for computing how much above/below the bare
+    /// minimum `approving_guardians` actually was.
+    pub threshold: u32,
+    /// Ledger sequence at which the timelock elapsed and this recovery
+    /// became executable (`RecoveryProposal.ready_at` at execution time).
+    pub ready_at: u32,
+    /// Ledger sequence of the `execute_recovery` call itself. Comparing
+    /// this against `ready_at` tells an observer how promptly the
+    /// now-executable recovery was actually claimed — a long gap can be
+    /// as meaningful to a monitoring system as the recovery itself (e.g.
+    /// "why did nobody execute an approved recovery for three days?").
+    pub executed_at: u32,
+}
+
 // ── Errors ────────────────────────────────────────────────────────────────────
 
 // Every discriminant below is deliberately part of one contiguous `1001+`
@@ -227,6 +274,7 @@ impl GlobeWallet {
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(WalletError::AlreadyInitialized);
         }
+        Self::bump_instance_ttl(&env);
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.events()
             .publish((Symbol::new(&env, "initialized"),), admin);
@@ -258,6 +306,7 @@ impl GlobeWallet {
     pub fn propose_admin(env: Env, current: Address, candidate: Address) -> Result<(), WalletError> {
         current.require_auth();
         Self::require_admin(&env, &current)?;
+        Self::bump_instance_ttl(&env);
         env.storage()
             .instance()
             .set(&DataKey::PendingAdmin(current.clone()), &candidate);
@@ -284,6 +333,7 @@ impl GlobeWallet {
         if pending != candidate {
             return Err(WalletError::Unauthorized);
         }
+        Self::bump_instance_ttl(&env);
         env.storage().instance().set(&DataKey::Admin, &candidate);
         env.storage()
             .instance()
@@ -299,6 +349,7 @@ impl GlobeWallet {
     pub fn cancel_admin_transfer(env: Env, current: Address) -> Result<(), WalletError> {
         current.require_auth();
         Self::require_admin(&env, &current)?;
+        Self::bump_instance_ttl(&env);
         env.storage()
             .instance()
             .remove(&DataKey::PendingAdmin(current.clone()));
@@ -334,6 +385,7 @@ impl GlobeWallet {
         if env.storage().instance().has(&DataKey::PendingUpgrade) {
             return Err(WalletError::UpgradeAlreadyPending);
         }
+        Self::bump_instance_ttl(&env);
         let ready_at = env.ledger().sequence().saturating_add(delay_in_ledgers);
         let proposal = UpgradeProposal {
             wasm_hash: wasm_hash.clone(),
@@ -393,6 +445,7 @@ impl GlobeWallet {
         if env.ledger().sequence() < proposal.ready_at {
             return Err(WalletError::UpgradeNotReady);
         }
+        Self::bump_instance_ttl(&env);
 
         // Pre-check: attempt to verify the wasm hash exists before calling
         // update_current_contract_wasm. This provides a typed WalletError
@@ -460,6 +513,7 @@ impl GlobeWallet {
         if guardians.len() >= Self::MAX_GUARDIANS {
             return Err(WalletError::GuardianLimitExceeded);
         }
+        Self::bump_instance_ttl(&env);
         guardians.push_back(guardian.clone());
         env.storage().instance().set(&DataKey::Guardians, &guardians);
         membership.set(guardian.clone(), true);
@@ -507,6 +561,7 @@ impl GlobeWallet {
     pub fn remove_guardian(env: Env, admin: Address, guardian: Address) -> Result<(), WalletError> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
+        Self::bump_instance_ttl(&env);
         let guardians = Self::guardians(env.clone());
         let mut new_guardians: Vec<Address> = Vec::new(&env);
         let mut found = false;
@@ -652,6 +707,7 @@ impl GlobeWallet {
         if guardians.len() < Self::MIN_GUARDIANS_FOR_RECOVERY || threshold > guardians.len() {
             return Err(WalletError::NotEnoughGuardians);
         }
+        Self::bump_instance_ttl(&env);
         let config = RecoveryConfig {
             threshold,
             delay_in_ledgers,
@@ -689,6 +745,7 @@ impl GlobeWallet {
         if env.storage().instance().has(&DataKey::RecoveryProposal) {
             return Err(WalletError::RecoveryAlreadyPending);
         }
+        Self::bump_instance_ttl(&env);
         let mut approvals: Vec<Address> = Vec::new(&env);
         approvals.push_back(guardian.clone());
         let proposal = RecoveryProposal {
@@ -720,6 +777,7 @@ impl GlobeWallet {
                 return Err(WalletError::AlreadyApproved);
             }
         }
+        Self::bump_instance_ttl(&env);
         proposal.approvals.push_back(guardian.clone());
         if proposal.approvals.len() >= config.threshold && proposal.ready_at.is_none() {
             let ready_at = env
@@ -773,6 +831,7 @@ impl GlobeWallet {
         if !found {
             return Err(WalletError::ApprovalNotFound);
         }
+        Self::bump_instance_ttl(&env);
         proposal.approvals = new_approvals;
         if proposal.approvals.len() < config.threshold {
             proposal.ready_at = None;
@@ -801,6 +860,25 @@ impl GlobeWallet {
     /// Any in-flight *normal* `propose_admin`/`accept_admin` transfer is
     /// cancelled as part of executing a recovery, so the two flows can't race.
     ///
+    /// # Events (see issue #91)
+    /// Publishes **two** events, deliberately, not one:
+    /// 1. `admin_transferred` — identical topic and payload shape to what
+    ///    `accept_admin` publishes for a routine, self-initiated transfer.
+    ///    Kept byte-for-byte unchanged so every existing consumer (the
+    ///    indexer, the mobile app) that already special-cases nothing about
+    ///    *how* the admin changed keeps working without modification.
+    /// 2. `recovery_completed` — new, published *in addition to* the above,
+    ///    carrying [`RecoveryCompletedEvent`]. This is the signal a
+    ///    security-monitoring integration should actually watch: unlike
+    ///    `admin_transferred`, its presence unambiguously means "guardian
+    ///    quorum just seized control of this wallet," which is precisely
+    ///    the moment a wallet owner most needs to be alerted through a side
+    ///    channel — and precisely the moment `admin_transferred` alone
+    ///    can't tell them that happened. See the doc comment on
+    ///    [`RecoveryCompletedEvent`] for why this is a struct rather than a
+    ///    tuple like every other event here, and why both events fire
+    ///    instead of just picking one.
+    ///
     /// # Errors
     /// * [`WalletError::RecoveryNewAdminUnchanged`] — the proposal's
     ///   `new_admin` is identical to the current admin (see issue #42). This
@@ -826,6 +904,7 @@ impl GlobeWallet {
         if proposal.new_admin == old_admin {
             return Err(WalletError::RecoveryNewAdminUnchanged);
         }
+        Self::bump_instance_ttl(&env);
         env.storage()
             .instance()
             .remove(&DataKey::PendingAdmin(old_admin.clone()));
@@ -833,13 +912,33 @@ impl GlobeWallet {
             .instance()
             .set(&DataKey::Admin, &proposal.new_admin);
         env.storage().instance().remove(&DataKey::RecoveryProposal);
-        // Same event name/shape as a normal transfer: downstream indexers
-        // and the mobile app don't need to special-case recovery-driven
-        // admin changes.
+
+        // Read once, before either event moves `old_admin`/`new_admin` by
+        // value below — both events need independent copies of the same
+        // addresses, and Soroban's `Address` is `Clone`, not `Copy`.
+        let executed_at = env.ledger().sequence();
+
+        // Event 1/2 — unchanged in name, shape, and ordering relative to
+        // every prior release: existing consumers see no difference.
         env.events().publish(
             (Symbol::new(&env, "admin_transferred"),),
-            (old_admin, proposal.new_admin),
+            (old_admin.clone(), proposal.new_admin.clone()),
         );
+
+        // Event 2/2 — new. See the doc comment above and on
+        // `RecoveryCompletedEvent` for the full rationale.
+        env.events().publish(
+            (Symbol::new(&env, "recovery_completed"),),
+            RecoveryCompletedEvent {
+                old_admin,
+                new_admin: proposal.new_admin,
+                approving_guardians: proposal.approvals,
+                threshold: config.threshold,
+                ready_at,
+                executed_at,
+            },
+        );
+
         Ok(())
     }
 
@@ -852,6 +951,7 @@ impl GlobeWallet {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
         Self::require_pending_recovery(&env)?;
+        Self::bump_instance_ttl(&env);
         env.storage().instance().remove(&DataKey::RecoveryProposal);
         env.events()
             .publish((Symbol::new(&env, "recovery_cancelled"),), admin);
@@ -923,6 +1023,7 @@ impl GlobeWallet {
                 return Err(WalletError::AssetAlreadyAdded);
             }
         }
+        Self::bump_instance_ttl(&env);
         assets.push_back(asset.clone());
         env.storage()
             .persistent()
@@ -961,6 +1062,7 @@ impl GlobeWallet {
         if !found {
             return Err(WalletError::AssetNotFound);
         }
+        Self::bump_instance_ttl(&env);
         env.storage()
             .persistent()
             .set(&DataKey::UserAssets(user.clone()), &new_assets);
@@ -1026,6 +1128,7 @@ impl GlobeWallet {
                 return Err(WalletError::SpendLimitExceeded);
             }
         }
+        Self::bump_instance_ttl(&env);
         env.storage().persistent().set(
             &DataKey::SpendLimit(user.clone(), asset_code.clone()),
             &limit,
@@ -1089,6 +1192,13 @@ impl GlobeWallet {
         if amount <= 0 {
             return Err(WalletError::InvalidSpendLimit);
         }
+        // A real spend is real wallet activity regardless of whether a
+        // limit happens to be configured for this asset — this is one of
+        // the most frequently-called functions in normal use, and exactly
+        // the kind of activity that should keep the contract's own
+        // instance storage from silently drifting toward archival (see
+        // `bump_instance_ttl`'s doc comment).
+        Self::bump_instance_ttl(&env);
         let limit = Self::get_spend_limit(env.clone(), user.clone(), asset_code.clone());
         if limit == 0 {
             // No limit configured → always allow
@@ -1147,6 +1257,7 @@ impl GlobeWallet {
         if len <= Self::MAX_ASSETS {
             return Ok(0);
         }
+        Self::bump_instance_ttl(&env);
         let mut trimmed: Vec<AssetInfo> = Vec::new(&env);
         for i in 0..Self::MAX_ASSETS {
             trimmed.push_back(assets.get(i).unwrap());
@@ -1213,6 +1324,50 @@ impl GlobeWallet {
         buf_a[..len] == buf_b[..len]
     }
 
+    /// Bump this contract's own *instance* storage TTL (`Admin`, `Guardians`,
+    /// `RecoveryConfig`, every `PendingAdmin(...)`/`PendingUpgrade`/
+    /// `RecoveryProposal` entry — everything that isn't per-user
+    /// `.persistent()` state) forward by the same window `UserAssets`/
+    /// `SpendLimit`/`DailySpent` already get via `PERSISTENT_TTL_THRESHOLD`/
+    /// `PERSISTENT_TTL_EXTEND_TO`.
+    ///
+    /// **Found and fixed while getting `cargo test --workspace` running for
+    /// issue #91** (see also `test_user_assets_ttl_extension_after_long_idle_period`
+    /// and `test_spend_limit_ttl_extension_after_long_idle_period`, which
+    /// were themselves already failing — not from anything about issue #91,
+    /// but because this exact gap let *instance* storage archive out from
+    /// under them mid-test): before this fix, not one function in this
+    /// contract ever extended the TTL of its own instance storage. Every
+    /// per-user entry (`UserAssets`, `SpendLimit`, `DailySpent`) was
+    /// carefully protected against silent archival; the contract's own core
+    /// state — `Admin`, the entire guardian/recovery subsystem, every
+    /// pending proposal — was not. A wallet that goes quiet for longer than
+    /// the network's default instance-entry lifetime (observably as little
+    /// as `min_persistent_entry_ttl`, a few thousand ledgers — well under a
+    /// day at Stellar's ~5s average close time, per the test environment's
+    /// own default) would have its instance archived, and *every* function
+    /// on the contract — including `admin()`, `guardians()`, and
+    /// `execute_recovery` itself, the one function specifically meant to
+    /// still work when almost nothing else does — would fail until someone
+    /// pays for an explicit, separate restore operation. This is a strictly
+    /// worse failure mode than anything the guardian-recovery subsystem
+    /// defends against: a wallet doesn't need a compromised or lost admin
+    /// key to become unusable, it just needs to be left alone long enough.
+    ///
+    /// Called at the start of every state-mutating function (after
+    /// authorization, so an unauthorized caller can't spend the contract's
+    /// budget triggering it) — cheap and idempotent: `extend_ttl` is a
+    /// no-op whenever the entry's current TTL already exceeds `threshold`,
+    /// so calling this on every write only ever *shortens* the average gap
+    /// since the last bump, never adds meaningful overhead to a wallet
+    /// that's already being used normally.
+    fn bump_instance_ttl(env: &Env) {
+        env.storage().instance().extend_ttl(
+            PERSISTENT_TTL_THRESHOLD,
+            PERSISTENT_TTL_EXTEND_TO,
+        );
+    }
+
     fn require_admin(env: &Env, caller: &Address) -> Result<(), WalletError> {
         let admin: Address = env
             .storage()
@@ -1258,8 +1413,8 @@ mod tests {
 
     use super::*;
     use soroban_sdk::{
-        testutils::{Address as _, Ledger as _},
-        Env, String, BytesN, Address,
+        testutils::{Address as _, Events as _, Ledger as _},
+        Env, String, BytesN, Address, TryFromVal, Val,
     };
 
     fn make_code(env: &Env, n: u32) -> String {
@@ -1668,16 +1823,24 @@ mod tests {
 
     #[test]
     fn test_max_assets_limit() {
+        // Pre-existing test bug found while getting `cargo test --workspace`
+        // running for issue #91: this test predates issue #29's requirement
+        // that a non-native asset (any code other than exactly "XLM") must
+        // carry a real issuer. It was registering 50 issuer-less assets and
+        // relying on the *last* one to fail with `AssetLimitExceeded` — but
+        // since #29 landed, the *first* one now fails with
+        // `InvalidAssetInfo` instead, for a completely different reason
+        // than the one this test exists to cover. Fixed by reusing the
+        // existing `fill_to_max` helper, which already gives each asset a
+        // real issuer — this was actually what it exists for; the test had
+        // simply drifted onto its own inline (and since-broken) copy of the
+        // same loop instead of calling it.
         let (env, _cid, _admin, client) = setup();
         let user = Address::generate(&env);
-        for i in 0..GlobeWallet::MAX_ASSETS {
-            let code = String::from_str(&env, &std::format!("ASSET{}", i));
-            let asset = AssetInfo { code, issuer: None };
-            client.add_asset(&user, &asset);
-        }
+        fill_to_max(&env, &client, &user);
         let extra = AssetInfo {
             code: String::from_str(&env, "EXTRA"),
-            issuer: None,
+            issuer: Some(Address::generate(&env)),
         };
         assert_eq!(
             client.try_add_asset(&user, &extra),
@@ -1730,11 +1893,13 @@ mod tests {
 
     #[test]
     fn test_migrate_user_assets_within_limit_does_nothing() {
+        // Same pre-existing issue-#29 gap as `test_max_assets_limit` above:
+        // a non-native asset needs a real issuer since #29 landed.
         let (env, _cid, admin, client) = setup();
         let user = Address::generate(&env);
         for i in 0..3 {
             let code = String::from_str(&env, &std::format!("ASSET{}", i));
-            let asset = AssetInfo { code, issuer: None };
+            let asset = AssetInfo { code, issuer: Some(Address::generate(&env)) };
             client.add_asset(&user, &asset);
         }
         let removed = client.migrate_user_assets(&admin, &user);
@@ -1881,7 +2046,7 @@ mod tests {
         let never_uploaded_hash = BytesN::from_array(&env, &[42u8; 32]);
 
         // propose_upgrade should succeed even with an invalid hash
-        assert_eq!(client.try_propose_upgrade(&admin, &never_uploaded_hash, &0u32), Ok(()));
+        assert_eq!(client.try_propose_upgrade(&admin, &never_uploaded_hash, &0u32), Ok(Ok(())));
 
         // The proposal is stored
         let cid = id.clone();
@@ -1937,7 +2102,7 @@ mod tests {
 
     #[test]
     fn test_add_and_list_guardians() {
-        let (env, _admin, guardians, client) = setup_with_guardians(3);
+        let (_env, _admin, guardians, client) = setup_with_guardians(3);
         let stored = client.guardians();
         assert_eq!(stored.len(), 3);
         for i in 0..3 {
@@ -2332,6 +2497,133 @@ mod tests {
         // side-effect-free on this rejection path) so guardians/admin can
         // still cancel it explicitly rather than it being silently consumed.
         assert!(client.recovery_proposal().is_some());
+    }
+
+    /// Decode the topics/data of the most-recently-published event whose
+    /// first topic is the given symbol name. Returns `None` if no such
+    /// event was published. This is the first place in this test module
+    /// events are decoded rather than just trusted to have fired — see
+    /// issue #91's Definition of done, which specifically requires proving
+    /// *which* events fired and *what* they carried, not just that
+    /// `execute_recovery`/`accept_admin` returned `Ok(())`.
+    fn find_event(env: &Env, topic_name: &str) -> Option<(soroban_sdk::Vec<Val>, Val)> {
+        let target = Symbol::new(env, topic_name);
+        for (_contract_id, topics, data) in env.events().all().iter() {
+            if let Some(first) = topics.first() {
+                if let Ok(sym) = Symbol::try_from_val(env, &first) {
+                    if sym == target {
+                        return Some((topics, data));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn test_execute_recovery_emits_both_admin_transferred_and_recovery_completed() {
+        // issue #91: execute_recovery must publish BOTH the pre-existing
+        // admin_transferred event (unchanged, for backward compatibility)
+        // AND a new, distinctly-named recovery_completed event carrying
+        // enough context for a monitoring integration to act on it.
+        let (env, admin, guardians, client) = setup_with_guardians(3);
+        client.set_recovery_config(&admin, &2u32, &10u32);
+
+        let new_admin = Address::generate(&env);
+        client.initiate_recovery(&guardians.get(0).unwrap(), &new_admin);
+        client.approve_recovery(&guardians.get(1).unwrap());
+        // Quorum (2) reached on this second approval; ready_at was armed as
+        // current_sequence + 10 inside approve_recovery. Advance exactly to
+        // that boundary so this test also pins the inclusive `>=` semantics
+        // execute_recovery's `env.ledger().sequence() < ready_at` check
+        // implies, rather than overshooting and leaving that untested.
+        let ready_at = client.recovery_proposal().unwrap().ready_at.unwrap();
+        env.ledger().with_mut(|l| l.sequence_number = ready_at);
+
+        client.execute_recovery();
+        assert_eq!(client.admin(), new_admin);
+
+        // ── admin_transferred: unchanged shape, so existing consumers are
+        // never asked to understand a new event just to keep working. ──
+        let (transferred_topics, transferred_data) =
+            find_event(&env, "admin_transferred").expect("admin_transferred must still be published");
+        assert_eq!(transferred_topics.len(), 1);
+        let decoded_transfer: (Address, Address) =
+            <(Address, Address)>::try_from_val(&env, &transferred_data).unwrap();
+        assert_eq!(decoded_transfer, (admin.clone(), new_admin.clone()));
+
+        // ── recovery_completed: the new, distinguishing event. ──
+        let (completed_topics, completed_data) =
+            find_event(&env, "recovery_completed").expect("recovery_completed must be published");
+        assert_eq!(completed_topics.len(), 1);
+        let decoded: RecoveryCompletedEvent =
+            RecoveryCompletedEvent::try_from_val(&env, &completed_data).unwrap();
+        assert_eq!(decoded.old_admin, admin);
+        assert_eq!(decoded.new_admin, new_admin);
+        // Exactly the two guardians who approved -- not the third, silent one.
+        assert_eq!(decoded.approving_guardians.len(), 2);
+        assert!(decoded.approving_guardians.contains(&guardians.get(0).unwrap()));
+        assert!(decoded.approving_guardians.contains(&guardians.get(1).unwrap()));
+        assert!(!decoded.approving_guardians.contains(&guardians.get(2).unwrap()));
+        assert_eq!(decoded.threshold, 2);
+        assert_eq!(decoded.ready_at, ready_at);
+        assert_eq!(decoded.executed_at, ready_at); // executed at the earliest possible ledger
+    }
+
+    #[test]
+    fn test_execute_recovery_emits_recovery_completed_with_full_over_quorum_guardian_set() {
+        // Companion to the test above: proves approving_guardians reflects
+        // every approval actually on the proposal, not just `threshold` of
+        // them -- a 5-guardian wallet recovered 5-of-5 is a materially
+        // different signal (overwhelming, unanimous consent) than the same
+        // wallet recovered at its bare 3-guardian threshold, and this field
+        // is what lets a monitoring integration tell the two apart.
+        let (env, admin, guardians, client) = setup_with_guardians(5);
+        client.set_recovery_config(&admin, &3u32, &5u32);
+
+        let new_admin = Address::generate(&env);
+        client.initiate_recovery(&guardians.get(0).unwrap(), &new_admin);
+        client.approve_recovery(&guardians.get(1).unwrap());
+        client.approve_recovery(&guardians.get(2).unwrap()); // quorum(3) reached here
+        client.approve_recovery(&guardians.get(3).unwrap()); // extra approval, above threshold
+        client.approve_recovery(&guardians.get(4).unwrap()); // unanimous
+
+        let ready_at = client.recovery_proposal().unwrap().ready_at.unwrap();
+        env.ledger().with_mut(|l| l.sequence_number = ready_at + 3); // executed a few ledgers late, on purpose
+
+        client.execute_recovery();
+
+        let (_, completed_data) =
+            find_event(&env, "recovery_completed").expect("recovery_completed must be published");
+        let decoded: RecoveryCompletedEvent =
+            RecoveryCompletedEvent::try_from_val(&env, &completed_data).unwrap();
+        assert_eq!(decoded.approving_guardians.len(), 5); // all five, not just the threshold(3)
+        assert_eq!(decoded.threshold, 3);
+        assert_eq!(decoded.ready_at, ready_at);
+        assert_eq!(decoded.executed_at, ready_at + 3); // the promptness gap is observable
+    }
+
+    #[test]
+    fn test_accept_admin_emits_only_admin_transferred_not_recovery_completed() {
+        // issue #91: a routine, self-initiated admin transfer must NOT
+        // publish recovery_completed -- that event's entire value is that
+        // its presence unambiguously means guardian recovery happened.
+        // If a normal accept_admin ever emitted it too, that guarantee
+        // (and every alerting integration built on it) would be worthless.
+        let (env, _cid, admin, client) = setup();
+        let candidate = Address::generate(&env);
+        client.propose_admin(&admin, &candidate);
+        client.accept_admin(&candidate);
+        assert_eq!(client.admin(), candidate);
+
+        assert!(
+            find_event(&env, "admin_transferred").is_some(),
+            "routine transfer must still emit admin_transferred"
+        );
+        assert!(
+            find_event(&env, "recovery_completed").is_none(),
+            "routine transfer must never emit recovery_completed"
+        );
     }
 
     #[test]

@@ -14,6 +14,50 @@ members = [
 # Requires careful migration testing due to protocol coupling and security-relevant fixes.
 soroban-sdk = { version = "21.7.7" }
 
+# `soroban-env-host` 21.2.1 — a transitive dependency of `soroban-sdk`
+# 21.7.7 via `soroban-ledger-snapshot`, pulled in only under the
+# `testutils` feature each contract's [dev-dependencies] enables — declares
+# its own `ed25519-dalek` requirement as `">=2.0.0"`, with no upper bound.
+# `soroban-sdk` itself also depends on `ed25519-dalek`, but with a proper
+# bound that keeps it on the 2.x line. As long as only 2.x existed on
+# crates.io this was harmless; `ed25519-dalek` 3.0.0 is a breaking release
+# (its `rand_core` integration moved to the newer fallible
+# `TryRng`/`TryCryptoRng` traits, which `rand_chacha` 0.3.1 — the RNG
+# `soroban-env-host` itself also pins — does not implement), so Cargo's
+# resolver picks 3.0.0 to satisfy `soroban-env-host`'s unbounded
+# requirement while `soroban-sdk` stays on 2.2.0, landing two incompatible
+# major versions of the same crate in one graph. The observable failure:
+# `soroban-env-host`'s own `testutils.rs` — compiled transitively by every
+# `#[test]` in this workspace — fails with `the trait bound ChaCha20Rng:
+# CryptoRng is not satisfied`. `cargo test --workspace` cannot run at all
+# until this is pinned, for anyone, regardless of anything in this
+# workspace's own code — found while getting a runnable test suite for
+# issue #91's Definition of done.
+#
+# This is an upstream Cargo.toml bug in `soroban-env-host` 21.2.1 (later
+# `soroban-env-host` releases bound the range properly — out of reach here
+# since `soroban-sdk` is pinned to 21.7.7, see the note above). The fix
+# needs to live in *this* file rather than in `Cargo.lock`, because
+# `Cargo.lock` is gitignored in this repo (see `.gitignore`) — a fix that
+# only edited the local lockfile would silently stop applying for every
+# other contributor and for CI the moment either regenerates it. Cargo's
+# `[patch]` mechanism requires the patch source to differ from the
+# original (crates.io can't "patch" a different version of itself — see
+# `cargo patch --help`: "point to a different source"), and
+# `dalek-cryptography/ed25519-dalek`'s upstream repository has no `2.2.0`
+# git tag to pin a git-source patch to (verified: only pre-release `2.0.0`
+# RCs are tagged) — so a git-source patch isn't reliably reproducible
+# either. Vendoring the exact, unmodified 2.2.0 package `soroban-sdk`
+# already resolves to (see `vendor/ed25519-dalek-2.2.0/`, copied verbatim
+# from the crates.io-published source, `.cargo-checksum.json` removed as
+# it's registry-cache-only metadata) as a `path` patch is the remaining
+# portable option: it satisfies Cargo's different-source requirement, pins
+# every consumer (including `soroban-env-host`) onto the one working
+# version instead of two conflicting ones, and needs no network access
+# beyond the initial `git clone` of this repo to resolve.
+[patch.crates-io]
+ed25519-dalek = { path = "vendor/ed25519-dalek-2.2.0" }
+
 [profile.release]
 opt-level = "z"
 overflow-checks = true
