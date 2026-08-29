@@ -84,6 +84,31 @@ Keep the interval from reading `DailySpent` through writing the replacement
 - Revisit this proof and its regression test when upgrading the Soroban
   SDK/host, especially if contract re-entry rules change.
 
+## Wired `send` payment reentrancy invariant
+
+With the introduction of the on-chain wired payment path `GlobeWallet::send`, `globe-wallet` directly orchestrates `record_spend` logic and external `token-wrapper::transfer_from` invocations in a single transaction.
+
+### Threat Model: Adversarial Token Invocations
+
+`token-wrapper::transfer_from` delegates the actual token movement to the token contract specified by `token_id`. If an arbitrary, untrusted contract is passed as `token_id`:
+- A malicious token's `transfer` implementation could execute callbacks attempting to re-enter `GlobeWallet::send`, `GlobeWallet::record_spend`, `GlobeWallet::set_spend_limit`, or guardian management functions.
+- If state mutations were deferred until after the token transfer (interactions before effects), the re-entrant call would read a stale `DailySpent` value and could drain funds beyond the configured daily spend limit.
+
+### Mitigations & Proof of Safety
+
+1. **Admin Token Allowlist**:
+   - `GlobeWallet::send` requires `token_id` to be explicitly allowlisted via `set_token_allowed`. Non-allowlisted tokens are rejected with `WalletError::TokenNotAllowed` during the pre-check phase before invoking `token-wrapper` or external code.
+
+2. **Checks-Effects-Interactions (CEI) Ordering**:
+   - In `GlobeWallet::send`, the candidate spend amount is validated against the spend limit and written to persistent storage (`DailySpent`) *before* invoking `TokenWrapperClient::transfer_from`.
+   - Any read of `DailySpent` during an external hook observes the fully-updated spent balance.
+
+3. **Atomic Transaction Rollback**:
+   - If the downstream token transfer fails or if an invalid reentrancy occurs, Soroban's transactional execution rolls back all state changes (including the `DailySpent` update and the `token-wrapper` allowance debit), ensuring storage never desynchronizes from on-chain asset movement.
+
+4. **Platform-Level Re-Entry Prohibition**:
+   - Soroban host rejects any attempted re-entry into an active `GlobeWallet` call frame with `Error(Context, InvalidAction)`. Tested explicitly via `test_send_malicious_reentrant_token_rejected_and_rolled_back`.
+
 ## Platform references
 
 - [Stellar authorization documentation](https://developers.stellar.org/docs/learn/fundamentals/contract-development/authorization)

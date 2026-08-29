@@ -8,9 +8,11 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 soroban-sdk = { workspace = true }
+token-wrapper = { path = "../token-wrapper" }
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
+token-wrapper = { path = "../token-wrapper", features = ["testutils"] }
 
 [features]
-testutils = ["soroban-sdk/testutils"]
+testutils = ["soroban-sdk/testutils", "token-wrapper/testutils"]

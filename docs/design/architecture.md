@@ -50,75 +50,77 @@ movement on Soroban**.
 └─────────────────────────────────────────┘
 ```
 
-## Current state: contracts are not wired together
+## Current state: reentrancy-safe wired payment architecture
 
-**As of the current codebase, globe-wallet and token-wrapper are fully independent
-and do not call each other.**
+GlobeWallet and token-wrapper are wired together on-chain via the `GlobeWallet::send` entry point:
 
-Verifying by inspection:
+1. **Allowance Delegation**: The user grants an allowance to `globe-wallet` via `token-wrapper::approve(owner=user, spender=globe_wallet_id, amount, expiry)`.
+2. **Wired Send**: The user invokes `globe-wallet::send(user, token_wrapper, token_id, to, asset_code, amount)`.
+3. **Enforcement & Settlement**:
+   - `globe-wallet` performs CHECKS (validates amount > 0, verifies `token_id` is on the admin-curated allowlist, checks daily spend limit).
+   - `globe-wallet` applies EFFECTS (records and commits updated `DailySpent` in persistent storage).
+   - `globe-wallet` executes INTERACTIONS (calls `token-wrapper::transfer_from(spender=globe_wallet_id, token_id, from=user, to, amount)` which debits the allowance and executes the token transfer).
 
-```bash
-# token-wrapper has zero awareness of globe-wallet's spend-limit logic
-$ grep -rn "globe_wallet\|GlobeWallet\|record_spend" contracts/token-wrapper/src/
-# → only the module doc comment string "GlobeWallet" — no code-level reference
-
-# globe-wallet has zero awareness of token-wrapper's allowance logic
-$ grep -rn "token_wrapper\|TokenWrapper\|transfer_from" contracts/globe-wallet/src/
-# → no matches at all
+```
+┌───────────────────────────────────────────────────────────┐
+│                        Integrator                         │
+│           (backend / wallet UI / mobile app)              │
+└─────────────┬─────────────────────────────────────────────┘
+              │ calls
+              ▼
+┌──────────────────────────────────────────────────────────┐
+│                      globe-wallet                        │
+│  ┌────────────────────────────────────────────────────┐  │
+│  │ 1. Checks: token allowlist & spend limit           │  │
+│  │ 2. Effects: commit DailySpent to storage           │  │
+│  └──────────┬─────────────────────────────────────────┘  │
+│             │ 3. Interactions (pass-through)             │
+│             ▼                                            │
+│  ┌────────────────────────────────────────────────────┐  │
+│  │ token-wrapper::transfer_from                       │  │
+│  │   ← allowance check & debit                        │  │
+│  │   ← external token contract transfer               │  │
+│  └────────────────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────────┘
 ```
 
-Neither contract stores the other's address, neither invokes the other via
-`env.invoke_contract`, and neither imports the other's client type.
+## Threat Model: Arbitrary Token Contract Execution
 
-## Security implication
+### Attack Vectors
+When a payment workflow invokes a caller-supplied `token_id`, the external contract code is untrusted. Unlike the standard Stellar Asset Contract (SAC), a custom or malicious token contract could:
+1. **Re-enter `globe-wallet` mid-flight**: The token contract's `transfer` implementation could call back into `globe-wallet::record_spend` or `globe-wallet::send` before the initial call unwinds, attempting to exploit inconsistent, half-committed spend limit state to bypass daily caps.
+2. **Manipulate wallet configuration**: A re-entrant call could attempt to modify guardians, trigger unauthorized recovery operations, or alter spend limits while an outer execution frame is open.
+3. **State desynchronization**: If spend recording and token transfer occurred non-atomically or without strict ordering, reentrancy could lead to double-counting or under-counting of daily expenditures.
 
-A payment routed through **`token-wrapper::transfer_from` directly** (bypassing
-`globe-wallet` entirely) is **not subject to any daily spend limit**. This is a
-materially weaker security posture than what the project's stated pitch
-("spend limits… to limit loss on key compromise") implies to anyone who hasn't
-read both contracts' full source.
+### Dual Mitigation Strategy
 
-> ⚠️ **Known gap:** Until globe-wallet and token-wrapper are wired together
-> (or a single entry-point contract is introduced that chains `record_spend`
-> before `transfer_from`), the spend-limit guarantee only applies when
-> integrators route through globe-wallet's API. There is no on-chain
-> enforcement preventing a caller from using token-wrapper directly and
-> bypassing the daily cap.
+To eliminate these threats completely, GlobeWallet implements both:
 
-## Integration guidance
+1. **Admin-Curated Token Allowlist (`set_token_allowed` / `is_token_allowed`)**:
+   - Only token contract addresses explicitly allowlisted by the contract administrator (`TokenNotAllowed = 1034`) can be passed to `send`.
+   - Untrusted or arbitrary token contracts are rejected during pre-flight checks before any downstream interaction or contract invocation occurs.
 
-For integrators (the backend repo, wallet UI, or mobile app), the correct
-payment path until the contracts are wired together is:
+2. **Checks-Effects-Interactions (CEI) Ordering Across the Wired Call Chain**:
+   - `globe-wallet::send` executes in strict CEI order:
+     - **Checks**: Validate `amount > 0`, verify `token_id` allowlist status, calculate candidate spend against configured daily limit.
+     - **Effects**: Write and commit the updated `DailySpent` record to persistent storage, extend TTL, and emit `spend_recorded`.
+     - **Interactions**: Only after all internal state is committed does `globe-wallet` invoke `token-wrapper::transfer_from`.
+   - Any re-entrant call mid-flight observes fully-committed, consistent state and cannot circumvent daily spend limits.
+   - If the downstream transfer fails, Soroban's transaction rollback guarantees that all storage mutations within the invocation revert atomically.
 
-1. **Call `globe-wallet::record_spend(user, asset_code, amount)`** — this enforces
-   the daily spend limit. If the limit is exceeded, the call fails and the
-   entire transaction reverts.
-2. **Call `token-wrapper::transfer_from(spender, token_id, from, to, amount)`** —
-   this checks the allowance and executes the SAC token transfer.
+3. **Soroban Platform Invariants**:
+   - Soroban host runtime strictly enforces `ContractReentryMode::Prohibited` for normal contract calls, causing any attempted re-entry into active call frames to immediately trap with `Error(Context, InvalidAction)`.
 
-These must be called **together in a single transaction** (or at minimum
-`record_spend` must succeed before `transfer_from`) for the spend limit to
-take effect.
+## Integration Guidance
 
-The backend `src/services/contracts/globeWallet.ts` and
-`src/services/soroban.ts` integration layers should ensure both calls are made
-in the correct order for any user-initiated send operation.
+Integrators (backend API, mobile client, and web apps) should route payments through `globe-wallet::send`:
 
-## Future: wiring the contracts together
+1. User approves the GlobeWallet contract address on `token-wrapper` once per session or spend allowance:
+   `token-wrapper.approve(user, globe_wallet_id, allowance_amount, expiry_ledger)`
+2. User executes payment:
+   `globe-wallet.send(user, token_wrapper_id, token_id, recipient, asset_code, amount)`
 
-A follow-up issue should track actually wiring the contracts so that the
-spend-limit guarantee is enforced on-chain rather than relying on integrator
-discipline:
+## Related Documents
 
-- globe-wallet could be given the token-wrapper contract ID and call
-  `transfer_from` internally after `record_spend` succeeds.
-- Or a new entry-point function on globe-wallet (e.g., `send`) could be added
-  that atomically calls `record_spend` → `transfer_from`.
-- Either approach closes the bypass gap and makes the "spend limits to limit
-  loss on key compromise" claim hold for every on-chain payment path.
-
-## Related documents
-
-- [record_spend day-boundary analysis](./record_spend_boundary.md) — how the
-  fixed-bucket daily spend window works, including boundary guarantees and
-  the ±1 s drift edge case.
+- [record_spend reentrancy & wiring proof](../record-spend-reentrancy.md) — comprehensive proof and security invariants for `record_spend` and wired `send`.
+- [record_spend day-boundary analysis](./record_spend_boundary.md) — fixed-bucket daily spend window guarantees.

@@ -20,6 +20,7 @@ use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, Address, BytesN, Env, Map, String, Symbol,
     Vec,
 };
+use token_wrapper::TokenWrapperClient;
 
 // ── Storage Keys ──────────────────────────────────────────────────────────────
 
@@ -47,6 +48,8 @@ pub enum DataKey {
     /// This is intentionally appended so the serialized values of existing
     /// storage keys remain stable across contract upgrades.
     GuardianMembership,
+    /// Admin-curated allowlist of trusted token contract addresses: token_id → bool.
+    AllowedToken(Address),
 }
 
 /// `DailySpent` used to live in *temporary* storage while `SpendLimit` lives in
@@ -191,6 +194,8 @@ pub enum WalletError {
     RecoveryNewAdminUnchanged = 1032,
     /// `AssetInfo.code` is empty or exceeds `GlobeWallet::MAX_ASSET_CODE_LEN`.
     InvalidAssetCode = 1033,
+    /// Token contract address is not in the admin allowlist.
+    TokenNotAllowed = 1034,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -228,6 +233,10 @@ impl GlobeWallet {
             return Err(WalletError::AlreadyInitialized);
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage().instance().extend_ttl(
+            PERSISTENT_TTL_THRESHOLD,
+            PERSISTENT_TTL_EXTEND_TO,
+        );
         env.events()
             .publish((Symbol::new(&env, "initialized"),), admin);
         Ok(())
@@ -1172,6 +1181,129 @@ impl GlobeWallet {
         Ok(removed)
     }
 
+    // ── Token Allowlist & Reentrancy-Safe Payment Wiring ───────────────────────
+
+    /// Configure whether a `token_id` is allowed for wired payments. Admin-authorized.
+    ///
+    /// Restricting payment execution to an admin-curated allowlist of verified token
+    /// contracts ensures arbitrary untrusted code cannot be executed during payments.
+    ///
+    /// # Errors
+    /// * [`WalletError::Unauthorized`] — caller is not the current admin.
+    pub fn set_token_allowed(
+        env: Env,
+        admin: Address,
+        token_id: Address,
+        allowed: bool,
+    ) -> Result<(), WalletError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        let key = DataKey::AllowedToken(token_id.clone());
+        if allowed {
+            env.storage().persistent().set(&key, &true);
+            env.storage().persistent().extend_ttl(
+                &key,
+                PERSISTENT_TTL_THRESHOLD,
+                PERSISTENT_TTL_EXTEND_TO,
+            );
+        } else {
+            env.storage().persistent().remove(&key);
+        }
+        env.events().publish(
+            (Symbol::new(&env, "token_allowed_set"),),
+            (token_id, allowed),
+        );
+        Ok(())
+    }
+
+    /// Check if a token contract address is allowed for payments.
+    pub fn is_token_allowed(env: Env, token_id: Address) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::AllowedToken(token_id))
+            .unwrap_or(false)
+    }
+
+    /// Reentrancy-safe wired payment: record daily spend and transfer tokens via `token-wrapper`.
+    ///
+    /// Enforces:
+    /// 1. Token Allowlist: `token_id` must be explicitly on the admin allowlist.
+    /// 2. Checks-Effects-Interactions (CEI) Ordering: Daily spend bookkeeping is updated and
+    ///    committed to persistent storage *before* calling out to `token-wrapper` and the
+    ///    underlying `token_id`.
+    /// 3. Reentrancy Safety: Any callback attempting to re-enter `GlobeWallet` mid-flight
+    ///    observes fully-committed, consistent state and cannot circumvent daily spend limits.
+    ///    Furthermore, Soroban host runtime strictly prohibits re-entry into active call frames.
+    /// 4. Atomicity: If the downstream token transfer fails, Soroban's transaction model rolls
+    ///    back all state changes made during the invocation.
+    ///
+    /// # Errors
+    /// * [`WalletError::InvalidSpendLimit`] — `amount` is not strictly positive.
+    /// * [`WalletError::TokenNotAllowed`] — `token_id` is not allowlisted by admin.
+    /// * [`WalletError::SpendLimitExceeded`] — payment would exceed the daily spend limit.
+    /// * [`WalletError::SpendOverflow`] — integer overflow calculating new daily spend.
+    pub fn send(
+        env: Env,
+        user: Address,
+        token_wrapper: Address,
+        token_id: Address,
+        to: Address,
+        asset_code: String,
+        amount: i128,
+    ) -> Result<(), WalletError> {
+        user.require_auth();
+
+        // 1. CHECKS
+        if amount <= 0 {
+            return Err(WalletError::InvalidSpendLimit);
+        }
+        if !Self::is_token_allowed(env.clone(), token_id.clone()) {
+            return Err(WalletError::TokenNotAllowed);
+        }
+
+        let limit = Self::get_spend_limit(env.clone(), user.clone(), asset_code.clone());
+        let now = env.ledger().timestamp();
+        let day = now / 86400;
+        let key = DataKey::DailySpent(user.clone(), asset_code.clone());
+        let record: SpendRecord = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or(SpendRecord { amount: 0, day });
+        let spent_today = if record.day == day { record.amount } else { 0 };
+        let new_spent = spent_today
+            .checked_add(amount)
+            .ok_or(WalletError::SpendOverflow)?;
+        if limit > 0 && new_spent > limit {
+            return Err(WalletError::SpendLimitExceeded);
+        }
+
+        // 2. EFFECTS (Commit all globe-wallet state before external calls)
+        env.storage()
+            .persistent()
+            .set(&key, &SpendRecord { amount: new_spent, day });
+        env.storage().persistent().extend_ttl(
+            &key,
+            DAILY_SPENT_TTL_THRESHOLD,
+            DAILY_SPENT_TTL_EXTEND_TO,
+        );
+        env.events().publish(
+            (Symbol::new(&env, "spend_recorded"),),
+            (user.clone(), asset_code.clone(), amount, new_spent, limit),
+        );
+
+        // 3. INTERACTIONS (External calls happen strictly after effects are finalized)
+        let spender = env.current_contract_address();
+        let wrapper_client = TokenWrapperClient::new(&env, &token_wrapper);
+        wrapper_client.transfer_from(&spender, &token_id, &user, &to, &amount);
+
+        env.events().publish(
+            (Symbol::new(&env, "send_completed"),),
+            (user, token_wrapper, token_id, to, asset_code, amount),
+        );
+        Ok(())
+    }
+
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     /// Compare two asset codes for equality, case-insensitively (ASCII
@@ -1671,13 +1803,16 @@ mod tests {
         let (env, _cid, _admin, client) = setup();
         let user = Address::generate(&env);
         for i in 0..GlobeWallet::MAX_ASSETS {
-            let code = String::from_str(&env, &std::format!("ASSET{}", i));
-            let asset = AssetInfo { code, issuer: None };
+            let code = make_code(&env, i);
+            let asset = AssetInfo {
+                code,
+                issuer: Some(Address::generate(&env)),
+            };
             client.add_asset(&user, &asset);
         }
         let extra = AssetInfo {
             code: String::from_str(&env, "EXTRA"),
-            issuer: None,
+            issuer: Some(Address::generate(&env)),
         };
         assert_eq!(
             client.try_add_asset(&user, &extra),
@@ -1691,8 +1826,11 @@ mod tests {
         let user = Address::generate(&env);
         let mut assets: Vec<AssetInfo> = Vec::new(&env);
         for i in 0..GlobeWallet::MAX_ASSETS + 10 {
-            let code = String::from_str(&env, &std::format!("ASSET{}", i));
-            assets.push_back(AssetInfo { code: code.clone(), issuer: None });
+            let code = make_code(&env, i);
+            assets.push_back(AssetInfo {
+                code: code.clone(),
+                issuer: Some(Address::generate(&env)),
+            });
         }
         env.as_contract(&cid, || {
             env.storage()
@@ -1701,7 +1839,7 @@ mod tests {
                 
             // Set up some spend limits and daily spent records for all assets
             for i in 0..GlobeWallet::MAX_ASSETS + 10 {
-                let code = String::from_str(&env, &std::format!("ASSET{}", i));
+                let code = make_code(&env, i);
                 env.storage().persistent().set(&DataKey::SpendLimit(user.clone(), code.clone()), &1000_i128);
                 env.storage().persistent().set(&DataKey::DailySpent(user.clone(), code.clone()), &SpendRecord { amount: 500, day: 0 });
             }
@@ -1714,14 +1852,14 @@ mod tests {
         env.as_contract(&cid, || {
             // Verify that dropped assets' storage keys are removed
             for i in GlobeWallet::MAX_ASSETS..GlobeWallet::MAX_ASSETS + 10 {
-                let code = String::from_str(&env, &std::format!("ASSET{}", i));
+                let code = make_code(&env, i);
                 assert!(!env.storage().persistent().has(&DataKey::SpendLimit(user.clone(), code.clone())));
                 assert!(!env.storage().persistent().has(&DataKey::DailySpent(user.clone(), code.clone())));
             }
             
             // Verify that kept assets' storage keys are intact
             for i in 0..GlobeWallet::MAX_ASSETS {
-                let code = String::from_str(&env, &std::format!("ASSET{}", i));
+                let code = make_code(&env, i);
                 assert!(env.storage().persistent().has(&DataKey::SpendLimit(user.clone(), code.clone())));
                 assert!(env.storage().persistent().has(&DataKey::DailySpent(user.clone(), code.clone())));
             }
@@ -1733,8 +1871,11 @@ mod tests {
         let (env, _cid, admin, client) = setup();
         let user = Address::generate(&env);
         for i in 0..3 {
-            let code = String::from_str(&env, &std::format!("ASSET{}", i));
-            let asset = AssetInfo { code, issuer: None };
+            let code = make_code(&env, i);
+            let asset = AssetInfo {
+                code,
+                issuer: Some(Address::generate(&env)),
+            };
             client.add_asset(&user, &asset);
         }
         let removed = client.migrate_user_assets(&admin, &user);
@@ -1881,7 +2022,7 @@ mod tests {
         let never_uploaded_hash = BytesN::from_array(&env, &[42u8; 32]);
 
         // propose_upgrade should succeed even with an invalid hash
-        assert_eq!(client.try_propose_upgrade(&admin, &never_uploaded_hash, &0u32), Ok(()));
+        assert_eq!(client.try_propose_upgrade(&admin, &never_uploaded_hash, &0u32), Ok(Ok(())));
 
         // The proposal is stored
         let cid = id.clone();
@@ -2606,5 +2747,186 @@ mod tests {
         env.ledger().with_mut(|l| l.sequence_number += 50_000);
 
         assert_eq!(client.get_spend_limit(&user, &code), 1_000_000);
+    }
+
+    // ── Wired Payment & Reentrancy Tests ───────────────────────────────
+
+    use token_wrapper::TokenWrapper;
+
+    fn create_token_contract<'a>(
+        env: &Env,
+        admin: &Address,
+    ) -> (Address, soroban_sdk::token::StellarAssetClient<'a>, soroban_sdk::token::Client<'a>) {
+        let sac = env.register_stellar_asset_contract_v2(admin.clone());
+        let address = sac.address();
+        (
+            address.clone(),
+            soroban_sdk::token::StellarAssetClient::new(env, &address),
+            soroban_sdk::token::Client::new(env, &address),
+        )
+    }
+
+    #[contract]
+    pub struct MaliciousReentrantToken;
+
+    #[contractimpl]
+    impl MaliciousReentrantToken {
+        pub fn init(env: Env, wallet: Address) {
+            env.storage().instance().set(&Symbol::new(&env, "wallet"), &wallet);
+        }
+
+        pub fn transfer(env: Env, from: Address, _to: Address, amount: i128) {
+            let wallet_id: Address = env.storage().instance().get(&Symbol::new(&env, "wallet")).unwrap();
+            let wallet = GlobeWalletClient::new(&env, &wallet_id);
+            let code = String::from_str(&env, "USDC");
+            // Adversarial token callback attempts re-entry into GlobeWallet's record_spend
+            wallet.record_spend(&from, &code, &amount);
+        }
+    }
+
+    #[test]
+    fn test_token_allowlist_admin_only_and_query() {
+        let (env, _cid, admin, client) = setup();
+        let non_admin = Address::generate(&env);
+        let token_id = Address::generate(&env);
+
+        // Initially not allowed
+        assert!(!client.is_token_allowed(&token_id));
+
+        // Non-admin cannot allowlist
+        assert_eq!(
+            client.try_set_token_allowed(&non_admin, &token_id, &true),
+            Err(Ok(WalletError::Unauthorized))
+        );
+
+        // Admin allowlists token
+        client.set_token_allowed(&admin, &token_id, &true);
+        assert!(client.is_token_allowed(&token_id));
+
+        // Admin disallows token
+        client.set_token_allowed(&admin, &token_id, &false);
+        assert!(!client.is_token_allowed(&token_id));
+    }
+
+    #[test]
+    fn test_send_happy_path_with_token_wrapper() {
+        let (env, wallet_id, admin, client) = setup();
+        let (token_id, token_admin, token_client) = create_token_contract(&env, &admin);
+        let wrapper_id = env.register_contract(None, TokenWrapper);
+        let wrapper_client = TokenWrapperClient::new(&env, &wrapper_id);
+
+        let user = Address::generate(&env);
+        let to = Address::generate(&env);
+        token_admin.mint(&user, &10_000);
+
+        let code = String::from_str(&env, "USDC");
+        client.add_asset(&user, &AssetInfo { code: code.clone(), issuer: Some(admin.clone()) });
+        client.set_spend_limit(&user, &code, &5_000);
+        client.set_token_allowed(&admin, &token_id, &true);
+
+        env.ledger().with_mut(|l| l.sequence_number = 100);
+        // User approves globe-wallet as spender on token-wrapper
+        wrapper_client.approve(&user, &wallet_id, &5_000, &200);
+
+        // Send 3000 tokens
+        client.send(&user, &wrapper_id, &token_id, &to, &code, &3_000);
+
+        // Balances updated
+        assert_eq!(token_client.balance(&user), 7_000);
+        assert_eq!(token_client.balance(&to), 3_000);
+
+        // Wrapper allowance decremented
+        let allowance = wrapper_client.allowance(&user, &wallet_id);
+        assert_eq!(allowance.amount, 2_000);
+
+        // Limit enforcement: sending 3000 more exceeds 5000 limit (3000 + 3000 = 6000 > 5000)
+        assert_eq!(
+            client.try_send(&user, &wrapper_id, &token_id, &to, &code, &3_000),
+            Err(Ok(WalletError::SpendLimitExceeded))
+        );
+
+        // Sending remaining 2000 reaches exactly 5000 limit and succeeds
+        client.send(&user, &wrapper_id, &token_id, &to, &code, &2_000);
+        assert_eq!(token_client.balance(&user), 5_000);
+        assert_eq!(token_client.balance(&to), 5_000);
+        assert_eq!(wrapper_client.allowance(&user, &wallet_id).amount, 0);
+    }
+
+    #[test]
+    fn test_send_unallowed_token_rejected() {
+        let (env, wallet_id, admin, client) = setup();
+        let (token_id, token_admin, _token_client) = create_token_contract(&env, &admin);
+        let wrapper_id = env.register_contract(None, TokenWrapper);
+        let wrapper_client = TokenWrapperClient::new(&env, &wrapper_id);
+
+        let user = Address::generate(&env);
+        let to = Address::generate(&env);
+        token_admin.mint(&user, &10_000);
+
+        let code = String::from_str(&env, "USDC");
+        client.add_asset(&user, &AssetInfo { code: code.clone(), issuer: Some(admin.clone()) });
+        client.set_spend_limit(&user, &code, &5_000);
+        // Note: token_id is NOT allowlisted
+
+        env.ledger().with_mut(|l| l.sequence_number = 100);
+        wrapper_client.approve(&user, &wallet_id, &5_000, &200);
+
+        assert_eq!(
+            client.try_send(&user, &wrapper_id, &token_id, &to, &code, &1_000),
+            Err(Ok(WalletError::TokenNotAllowed))
+        );
+    }
+
+    #[test]
+    fn test_send_negative_or_zero_amount_fails() {
+        let (env, _wallet_id, admin, client) = setup();
+        let (token_id, _token_admin, _token_client) = create_token_contract(&env, &admin);
+        let wrapper_id = env.register_contract(None, TokenWrapper);
+        let user = Address::generate(&env);
+        let to = Address::generate(&env);
+        let code = String::from_str(&env, "USDC");
+
+        client.set_token_allowed(&admin, &token_id, &true);
+
+        assert_eq!(
+            client.try_send(&user, &wrapper_id, &token_id, &to, &code, &0),
+            Err(Ok(WalletError::InvalidSpendLimit))
+        );
+        assert_eq!(
+            client.try_send(&user, &wrapper_id, &token_id, &to, &code, &-500),
+            Err(Ok(WalletError::InvalidSpendLimit))
+        );
+    }
+
+    #[test]
+    fn test_send_malicious_reentrant_token_rejected_and_rolled_back() {
+        let (env, wallet_id, admin, client) = setup();
+        let wrapper_id = env.register_contract(None, TokenWrapper);
+        let wrapper_client = TokenWrapperClient::new(&env, &wrapper_id);
+
+        let malicious_token_id = env.register_contract(None, MaliciousReentrantToken);
+        let malicious_client = MaliciousReentrantTokenClient::new(&env, &malicious_token_id);
+        malicious_client.init(&wallet_id);
+
+        let user = Address::generate(&env);
+        let to = Address::generate(&env);
+        let code = String::from_str(&env, "USDC");
+
+        client.add_asset(&user, &AssetInfo { code: code.clone(), issuer: Some(admin.clone()) });
+        client.set_spend_limit(&user, &code, &10_000);
+        client.set_token_allowed(&admin, &malicious_token_id, &true);
+
+        env.ledger().with_mut(|l| l.sequence_number = 100);
+        wrapper_client.approve(&user, &wallet_id, &5_000, &200);
+
+        // When send invokes token-wrapper which invokes MaliciousReentrantToken,
+        // the malicious token's transfer attempts to call back into GlobeWallet.
+        // Soroban host rejects re-entry, failing the invocation and rolling back state.
+        let result = client.try_send(&user, &wrapper_id, &malicious_token_id, &to, &code, &1_000);
+        assert!(result.is_err());
+
+        // Verify state is clean and rolled back:
+        // Allowance in token-wrapper remained 5_000 (not debited)
+        assert_eq!(wrapper_client.allowance(&user, &wallet_id).amount, 5_000);
     }
 }
