@@ -21,7 +21,7 @@
                   "bytes": "2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a"
                 },
                 {
-                  "u32": 0
+                  "u32": 51840
                 }
               ]
             }
@@ -34,7 +34,7 @@
   ],
   "ledger": {
     "protocol_version": 21,
-    "sequence_number": 1,
+    "sequence_number": 51840,
     "timestamp": 0,
     "network_id": "0000000000000000000000000000000000000000000000000000000000000000",
     "base_reserve": 0,
@@ -100,7 +100,7 @@
                                 "symbol": "ready_at"
                               },
                               "val": {
-                                "u32": 0
+                                "u32": 51840
                               }
                             },
                             {
@@ -275,7 +275,7 @@
                   "bytes": "2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a"
                 },
                 {
-                  "u32": 0
+                  "u32": 51840
                 }
               ]
             }
@@ -305,7 +305,7 @@
                   "bytes": "2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a"
                 },
                 {
-                  "u32": 0
+                  "u32": 51840
                 }
               ]
             }

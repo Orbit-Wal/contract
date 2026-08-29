@@ -87,7 +87,7 @@
                   "u32": 2
                 },
                 {
-                  "u32": 10
+                  "u32": 17280
                 }
               ]
             }
@@ -143,7 +143,7 @@
   ],
   "ledger": {
     "protocol_version": 21,
-    "sequence_number": 10,
+    "sequence_number": 17280,
     "timestamp": 0,
     "network_id": "0000000000000000000000000000000000000000000000000000000000000000",
     "base_reserve": 0,
@@ -260,7 +260,7 @@
                                 "symbol": "delay_in_ledgers"
                               },
                               "val": {
-                                "u32": 10
+                                "u32": 17280
                               }
                             },
                             {
@@ -312,7 +312,7 @@
                                 "symbol": "ready_at"
                               },
                               "val": {
-                                "u32": 10
+                                "u32": 17280
                               }
                             }
                           ]
@@ -866,7 +866,7 @@
                   "u32": 2
                 },
                 {
-                  "u32": 10
+                  "u32": 17280
                 }
               ]
             }
@@ -893,7 +893,7 @@
                   "u32": 2
                 },
                 {
-                  "u32": 10
+                  "u32": 17280
                 }
               ]
             }
@@ -1048,7 +1048,7 @@
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
                 },
                 {
-                  "u32": 10
+                  "u32": 17280
                 }
               ]
             }
@@ -1323,7 +1323,7 @@
                     "symbol": "ready_at"
                   },
                   "val": {
-                    "u32": 10
+                    "u32": 17280
                   }
                 }
               ]
