@@ -255,6 +255,12 @@ pub enum WalletError {
     /// The `token-wrapper::transfer_from` call `send` makes failed (e.g.
     /// insufficient/expired allowance) or could not be invoked at all.
     TokenTransferFailed = 1036,
+    /// `propose_upgrade`'s `delay_in_ledgers` is below
+    /// [`GlobeWallet::MIN_UPGRADE_DELAY_LEDGERS`] (see issue #84).
+    UpgradeDelayTooShort = 1037,
+    /// `set_recovery_config`'s `delay_in_ledgers` is below
+    /// [`GlobeWallet::MIN_RECOVERY_DELAY_LEDGERS`] (see issue #84).
+    RecoveryDelayTooShort = 1038,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -282,6 +288,40 @@ impl GlobeWallet {
     /// comfortable headroom above any realistic threshold while keeping
     /// per-call cost bounded and predictable.
     pub const MAX_GUARDIANS: u32 = 15;
+
+    /// Minimum delay (in ledgers) `propose_upgrade` must enforce between a
+    /// proposal and `execute_upgrade` becoming callable (see issue #84).
+    ///
+    /// Without a floor, `delay_in_ledgers = 0` makes "propose" and "execute"
+    /// indistinguishable from a single atomic code swap — the exact opposite
+    /// of the documented purpose ("wait for the delay to elapse before
+    /// executing"). `propose_upgrade` requires only the *current* admin key,
+    /// not guardian quorum, so this timelock is the *only* defense against a
+    /// compromised admin key entrenching itself by swapping the contract's
+    /// code before anyone watching `upgrade_proposed` can react. Three days'
+    /// worth of ledgers (`LEDGERS_PER_DAY * 3`) is chosen — deliberately
+    /// longer than [`Self::MIN_RECOVERY_DELAY_LEDGERS`] — because a code
+    /// swap is a strictly larger blast radius than an admin-key rotation and
+    /// deserves enough margin for a human (not just an automated monitor) to
+    /// notice and respond even across a weekend.
+    pub const MIN_UPGRADE_DELAY_LEDGERS: u32 = LEDGERS_PER_DAY * 3;
+
+    /// Minimum delay (in ledgers) `set_recovery_config` must enforce between
+    /// guardian quorum being reached and `execute_recovery` becoming
+    /// callable (see issue #84).
+    ///
+    /// Mirrors [`Self::MIN_UPGRADE_DELAY_LEDGERS`]'s rationale: a `delay_in_ledgers`
+    /// floor is required because the doc comment on [`RecoveryConfig::delay_in_ledgers`]
+    /// promises the admin "a window to notice and cancel a malicious or
+    /// mistaken recovery" — a promise `delay_in_ledgers = 0` breaks entirely,
+    /// since `cancel_recovery` would then have to race the very transaction
+    /// that reached quorum. Recovery already has one layer `propose_upgrade`
+    /// lacks (independent guardian quorum, not a single key), so one day's
+    /// worth of ledgers (`LEDGERS_PER_DAY`) is a sufficient floor for this
+    /// second layer: enough for a human to plausibly notice the
+    /// `recovery_quorum_reached` event, without needlessly delaying a
+    /// legitimate lost-device recovery that quorum has already vetted.
+    pub const MIN_RECOVERY_DELAY_LEDGERS: u32 = LEDGERS_PER_DAY;
 
     /// Initialize the contract with an admin address.
     ///
@@ -388,6 +428,8 @@ impl GlobeWallet {
     /// # Errors
     /// * [`WalletError::UpgradeAlreadyPending`] — an upgrade is already queued
     /// * [`WalletError::Unauthorized`] — caller is not the current admin
+    /// * [`WalletError::UpgradeDelayTooShort`] — `delay_in_ledgers` is below
+    ///   [`Self::MIN_UPGRADE_DELAY_LEDGERS`] (see issue #84)
     ///
     /// See [`Self::execute_upgrade`] for operational notes and the correct
     /// sequence of steps (upload → propose → wait → execute).
@@ -403,6 +445,9 @@ impl GlobeWallet {
             return Err(WalletError::UpgradeAlreadyPending);
         }
         Self::bump_instance_ttl(&env);
+        if delay_in_ledgers < Self::MIN_UPGRADE_DELAY_LEDGERS {
+            return Err(WalletError::UpgradeDelayTooShort);
+        }
         let ready_at = env.ledger().sequence().saturating_add(delay_in_ledgers);
         let proposal = UpgradeProposal {
             wasm_hash: wasm_hash.clone(),
@@ -706,6 +751,8 @@ impl GlobeWallet {
     ///   `threshold > guardians.len()`.
     /// * [`WalletError::RecoveryAlreadyPending`] — a `RecoveryProposal` is
     ///   currently in flight; call `cancel_recovery` first.
+    /// * [`WalletError::RecoveryDelayTooShort`] — `delay_in_ledgers` is below
+    ///   [`Self::MIN_RECOVERY_DELAY_LEDGERS`] (see issue #84).
     pub fn set_recovery_config(
         env: Env,
         admin: Address,
@@ -725,6 +772,9 @@ impl GlobeWallet {
             return Err(WalletError::NotEnoughGuardians);
         }
         Self::bump_instance_ttl(&env);
+        if delay_in_ledgers < Self::MIN_RECOVERY_DELAY_LEDGERS {
+            return Err(WalletError::RecoveryDelayTooShort);
+        }
         let config = RecoveryConfig {
             threshold,
             delay_in_ledgers,
@@ -2124,9 +2174,10 @@ mod tests {
         client.add_asset(&user, &xlm(&env));
 
         let wasm_hash = BytesN::from_array(&env, &[3u8; 32]);
-        client.propose_upgrade(&admin, &wasm_hash, &1u32);
+        client.propose_upgrade(&admin, &wasm_hash, &GlobeWallet::MIN_UPGRADE_DELAY_LEDGERS);
 
-        env.ledger().set_sequence_number(2);
+        env.ledger()
+            .set_sequence_number(GlobeWallet::MIN_UPGRADE_DELAY_LEDGERS);
         // Traps here (host-level), after all contract-level checks passed.
         client.execute_upgrade(&admin, &wasm_hash);
     }
@@ -2166,7 +2217,7 @@ mod tests {
         client.initialize(&admin);
 
         let wasm_hash = BytesN::from_array(&env, &[7u8; 32]);
-        client.propose_upgrade(&admin, &wasm_hash, &5u32);
+        client.propose_upgrade(&admin, &wasm_hash, &GlobeWallet::MIN_UPGRADE_DELAY_LEDGERS);
 
         // A non-admin cannot execute the upgrade, even once proposed —
         // rejected before the timelock or hash is even inspected.
@@ -2176,9 +2227,9 @@ mod tests {
             Err(Ok(WalletError::Unauthorized))
         );
 
-        // The timelock (ready_at = ledger 0 + delay 5) has not elapsed yet
-        // — the test env's ledger sequence defaults to 0 — so even the
-        // legitimate admin must be rejected.
+        // The timelock (ready_at = ledger 0 + MIN_UPGRADE_DELAY_LEDGERS) has
+        // not elapsed yet — the test env's ledger sequence defaults to 0 —
+        // so even the legitimate admin must be rejected.
         assert_eq!(
             client.try_execute_upgrade(&admin, &wasm_hash),
             Err(Ok(WalletError::UpgradeNotReady))
@@ -2196,7 +2247,7 @@ mod tests {
 
         let wasm_hash = BytesN::from_array(&env, &[9u8; 32]);
         let other_hash = BytesN::from_array(&env, &[10u8; 32]);
-        client.propose_upgrade(&admin, &wasm_hash, &0u32);
+        client.propose_upgrade(&admin, &wasm_hash, &GlobeWallet::MIN_UPGRADE_DELAY_LEDGERS);
         env.ledger().set_sequence_number(1);
         assert_eq!(
             client.try_execute_upgrade(&admin, &other_hash),
@@ -2222,7 +2273,11 @@ mod tests {
 
         // propose_upgrade should succeed even with an invalid hash
         assert_eq!(
-            client.try_propose_upgrade(&admin, &never_uploaded_hash, &0u32),
+            client.try_propose_upgrade(
+                &admin,
+                &never_uploaded_hash,
+                &GlobeWallet::MIN_UPGRADE_DELAY_LEDGERS
+            ),
             Ok(Ok(()))
         );
 
@@ -2256,13 +2311,129 @@ mod tests {
         client.initialize(&admin);
 
         let never_uploaded_hash = BytesN::from_array(&env, &[42u8; 32]);
-        client.propose_upgrade(&admin, &never_uploaded_hash, &0u32);
-        env.ledger().set_sequence_number(1);
+        client.propose_upgrade(
+            &admin,
+            &never_uploaded_hash,
+            &GlobeWallet::MIN_UPGRADE_DELAY_LEDGERS,
+        );
+        env.ledger()
+            .set_sequence_number(GlobeWallet::MIN_UPGRADE_DELAY_LEDGERS);
 
         // This call should panic/trap at the host level because the hash
         // was never uploaded via upload_contract_wasm. The test is marked
         // #[should_panic] to capture that behavior.
         client.execute_upgrade(&admin, &never_uploaded_hash);
+    }
+
+    // ── Issue #84: minimum timelock delays ──────────────────────────────────
+
+    #[test]
+    fn test_propose_upgrade_rejects_zero_delay() {
+        // Direct port of issue #84's reproduction: delay_in_ledgers = 0 used
+        // to make `execute_upgrade` immediately callable, collapsing the
+        // "propose then wait" timelock into a single atomic step.
+        let (env, cid, admin, client) = setup();
+        let wasm_hash = BytesN::from_array(&env, &[7u8; 32]);
+        assert_eq!(
+            client.try_propose_upgrade(&admin, &wasm_hash, &0u32),
+            Err(Ok(WalletError::UpgradeDelayTooShort))
+        );
+        // No proposal was stored — the rejection is not a "propose now,
+        // reject on execute" style check.
+        env.as_contract(&cid, || {
+            assert!(!env.storage().instance().has(&DataKey::PendingUpgrade));
+        });
+    }
+
+    #[test]
+    fn test_propose_upgrade_rejects_delay_below_minimum() {
+        let (env, _cid, admin, client) = setup();
+        let wasm_hash = BytesN::from_array(&env, &[7u8; 32]);
+        assert_eq!(
+            client.try_propose_upgrade(
+                &admin,
+                &wasm_hash,
+                &(GlobeWallet::MIN_UPGRADE_DELAY_LEDGERS - 1)
+            ),
+            Err(Ok(WalletError::UpgradeDelayTooShort))
+        );
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_propose_upgrade_accepts_delay_at_minimum() {
+        // No regression to the happy path: exactly the minimum must still
+        // be accepted by `propose_upgrade`, and once the timelock genuinely
+        // elapses `execute_upgrade` must pass every contract-level gate
+        // (admin, hash match, and — the new one — nothing left to check but
+        // readiness) and reach the same host-level trap
+        // `test_propose_and_execute_upgrade` and
+        // `test_execute_upgrade_with_never_uploaded_hash_traps` already rely
+        // on as proof there's no real WASM fixture needed to exercise this.
+        let (env, _cid, admin, client) = setup();
+        let wasm_hash = BytesN::from_array(&env, &[7u8; 32]);
+        assert_eq!(
+            client.try_propose_upgrade(&admin, &wasm_hash, &GlobeWallet::MIN_UPGRADE_DELAY_LEDGERS),
+            Ok(Ok(()))
+        );
+
+        env.ledger()
+            .set_sequence_number(GlobeWallet::MIN_UPGRADE_DELAY_LEDGERS);
+        // Traps here (host-level): every contract-level gate, including the
+        // new minimum-delay check at propose time, has already passed.
+        client.execute_upgrade(&admin, &wasm_hash);
+    }
+
+    #[test]
+    fn test_set_recovery_config_rejects_zero_delay() {
+        // Direct port of issue #84's reproduction: delay_in_ledgers = 0 used
+        // to leave the admin's post-quorum "notice and cancel" window
+        // (documented on `RecoveryConfig::delay_in_ledgers`) at zero ledgers.
+        let (_env, admin, _guardians, client) = setup_with_guardians(3);
+        assert_eq!(
+            client.try_set_recovery_config(&admin, &2u32, &0u32),
+            Err(Ok(WalletError::RecoveryDelayTooShort))
+        );
+        assert!(client.recovery_config().is_none());
+    }
+
+    #[test]
+    fn test_set_recovery_config_rejects_delay_below_minimum() {
+        let (_env, admin, _guardians, client) = setup_with_guardians(3);
+        assert_eq!(
+            client.try_set_recovery_config(
+                &admin,
+                &2u32,
+                &(GlobeWallet::MIN_RECOVERY_DELAY_LEDGERS - 1)
+            ),
+            Err(Ok(WalletError::RecoveryDelayTooShort))
+        );
+    }
+
+    #[test]
+    fn test_set_recovery_config_accepts_delay_at_minimum_and_recovery_executes() {
+        // No regression to the happy path: exactly the minimum must still
+        // configure successfully, and a recovery that waits exactly that
+        // long must still execute — full end-to-end coverage, not just the
+        // setter in isolation.
+        let (env, admin, guardians, client) = setup_with_guardians(3);
+        assert_eq!(
+            client.try_set_recovery_config(&admin, &2u32, &GlobeWallet::MIN_RECOVERY_DELAY_LEDGERS),
+            Ok(Ok(()))
+        );
+
+        let new_admin = Address::generate(&env);
+        client.initiate_recovery(&guardians.get(0).unwrap(), &new_admin);
+        client.approve_recovery(&guardians.get(1).unwrap());
+        assert_eq!(
+            client.try_execute_recovery(),
+            Err(Ok(WalletError::RecoveryNotReady))
+        );
+
+        env.ledger()
+            .with_mut(|l| l.sequence_number += GlobeWallet::MIN_RECOVERY_DELAY_LEDGERS);
+        client.execute_recovery();
+        assert_eq!(client.admin(), new_admin);
     }
 
     // ── Guardian Recovery ─────────────────────────────────────────────────
@@ -2327,7 +2498,7 @@ mod tests {
     #[test]
     fn test_remove_guardian_below_threshold_fails() {
         let (_env, admin, guardians, client) = setup_with_guardians(3);
-        client.set_recovery_config(&admin, &3u32, &10u32);
+        client.set_recovery_config(&admin, &3u32, &GlobeWallet::MIN_RECOVERY_DELAY_LEDGERS);
         assert_eq!(
             client.try_remove_guardian(&admin, &guardians.get(0).unwrap()),
             Err(Ok(WalletError::NotEnoughGuardians))
@@ -2337,7 +2508,7 @@ mod tests {
     #[test]
     fn test_removed_guardian_cannot_initiate_recovery() {
         let (env, admin, guardians, client) = setup_with_guardians(4);
-        client.set_recovery_config(&admin, &2u32, &10u32);
+        client.set_recovery_config(&admin, &2u32, &GlobeWallet::MIN_RECOVERY_DELAY_LEDGERS);
         let removed = guardians.get(0).unwrap();
         client.remove_guardian(&admin, &removed);
 
@@ -2354,7 +2525,7 @@ mod tests {
         // that approval, not just block them from casting *new* ones (that
         // half is already covered by `test_removed_guardian_cannot_initiate_recovery`).
         let (env, admin, guardians, client) = setup_with_guardians(3);
-        client.set_recovery_config(&admin, &2u32, &10u32);
+        client.set_recovery_config(&admin, &2u32, &GlobeWallet::MIN_RECOVERY_DELAY_LEDGERS);
         let new_admin = Address::generate(&env);
 
         client.initiate_recovery(&guardians.get(0).unwrap(), &new_admin); // G0
@@ -2389,7 +2560,7 @@ mod tests {
         // the stripping logic must key off actual proposal membership, not
         // just "a guardian was removed".
         let (env, admin, guardians, client) = setup_with_guardians(4);
-        client.set_recovery_config(&admin, &2u32, &10u32);
+        client.set_recovery_config(&admin, &2u32, &GlobeWallet::MIN_RECOVERY_DELAY_LEDGERS);
         let new_admin = Address::generate(&env);
 
         client.initiate_recovery(&guardians.get(0).unwrap(), &new_admin); // G0
@@ -2405,7 +2576,8 @@ mod tests {
         assert_eq!(proposal.approvals.len(), 2);
         assert_eq!(proposal.ready_at, ready_at_before);
 
-        env.ledger().with_mut(|l| l.sequence_number += 10);
+        env.ledger()
+            .with_mut(|l| l.sequence_number += GlobeWallet::MIN_RECOVERY_DELAY_LEDGERS);
         client.execute_recovery();
         assert_eq!(client.admin(), new_admin);
     }
@@ -2416,11 +2588,11 @@ mod tests {
         // must still be able to bring it back to quorum — with a *new*
         // ready_at, not a resurrected stale one.
         let (env, admin, guardians, client) = setup_with_guardians(3);
-        client.set_recovery_config(&admin, &2u32, &10u32);
+        client.set_recovery_config(&admin, &2u32, &GlobeWallet::MIN_RECOVERY_DELAY_LEDGERS);
         let new_admin = Address::generate(&env);
 
         client.initiate_recovery(&guardians.get(0).unwrap(), &new_admin); // G0
-        client.approve_recovery(&guardians.get(1).unwrap()); // G1 -> quorum, ready_at = seq + 10
+        client.approve_recovery(&guardians.get(1).unwrap()); // G1 -> quorum, ready_at = seq + delay
         client.remove_guardian(&admin, &guardians.get(1).unwrap()); // strips G1's approval, ready_at cleared
         assert!(client.recovery_proposal().unwrap().ready_at.is_none());
 
@@ -2430,7 +2602,8 @@ mod tests {
         let rearmed = client.recovery_proposal().unwrap().ready_at;
         assert!(rearmed.is_some());
 
-        env.ledger().with_mut(|l| l.sequence_number += 10);
+        env.ledger()
+            .with_mut(|l| l.sequence_number += GlobeWallet::MIN_RECOVERY_DELAY_LEDGERS);
         client.execute_recovery();
         assert_eq!(client.admin(), new_admin);
     }
@@ -2440,7 +2613,7 @@ mod tests {
         // `revoke_recovery_approval` previously never checked guardian
         // membership at all, unlike `initiate_recovery`/`approve_recovery`.
         let (env, admin, guardians, client) = setup_with_guardians(3);
-        client.set_recovery_config(&admin, &2u32, &10u32);
+        client.set_recovery_config(&admin, &2u32, &GlobeWallet::MIN_RECOVERY_DELAY_LEDGERS);
         let new_admin = Address::generate(&env);
         client.initiate_recovery(&guardians.get(0).unwrap(), &new_admin);
 
@@ -2458,7 +2631,7 @@ mod tests {
         // `approve_recovery` — membership is now enforced consistently
         // across every guardian-authenticated recovery entry point.
         let (env, admin, guardians, client) = setup_with_guardians(4);
-        client.set_recovery_config(&admin, &2u32, &10u32);
+        client.set_recovery_config(&admin, &2u32, &GlobeWallet::MIN_RECOVERY_DELAY_LEDGERS);
         let new_admin = Address::generate(&env);
         client.initiate_recovery(&guardians.get(0).unwrap(), &new_admin);
         client.approve_recovery(&guardians.get(1).unwrap());
@@ -2482,7 +2655,10 @@ mod tests {
         client.initialize(&admin);
 
         let wasm_hash = BytesN::from_array(&env, &[11u8; 32]);
-        client.propose_upgrade(&admin, &wasm_hash, &0u32);
+        client.propose_upgrade(&admin, &wasm_hash, &GlobeWallet::MIN_UPGRADE_DELAY_LEDGERS);
+        // Still rejected as "already pending" even with a too-short delay —
+        // the pending-proposal check takes precedence, matching the check
+        // order inside `propose_upgrade`.
         assert_eq!(
             client.try_propose_upgrade(&admin, &wasm_hash, &0u32),
             Err(Ok(WalletError::UpgradeAlreadyPending))
@@ -2493,7 +2669,7 @@ mod tests {
     fn test_set_recovery_config_requires_min_guardians() {
         let (_env, admin, _guardians, client) = setup_with_guardians(2);
         assert_eq!(
-            client.try_set_recovery_config(&admin, &2u32, &10u32),
+            client.try_set_recovery_config(&admin, &2u32, &GlobeWallet::MIN_RECOVERY_DELAY_LEDGERS),
             Err(Ok(WalletError::NotEnoughGuardians))
         );
     }
@@ -2502,7 +2678,7 @@ mod tests {
     fn test_set_recovery_config_rejects_single_guardian_threshold() {
         let (_env, admin, _guardians, client) = setup_with_guardians(3);
         assert_eq!(
-            client.try_set_recovery_config(&admin, &1u32, &10u32),
+            client.try_set_recovery_config(&admin, &1u32, &GlobeWallet::MIN_RECOVERY_DELAY_LEDGERS),
             Err(Ok(WalletError::InvalidRecoveryThreshold))
         );
     }
@@ -2511,7 +2687,7 @@ mod tests {
     fn test_set_recovery_config_rejects_threshold_above_guardian_count() {
         let (_env, admin, _guardians, client) = setup_with_guardians(3);
         assert_eq!(
-            client.try_set_recovery_config(&admin, &4u32, &10u32),
+            client.try_set_recovery_config(&admin, &4u32, &GlobeWallet::MIN_RECOVERY_DELAY_LEDGERS),
             Err(Ok(WalletError::NotEnoughGuardians))
         );
     }
@@ -2519,7 +2695,7 @@ mod tests {
     #[test]
     fn test_recovery_happy_path_2_of_3() {
         let (env, admin, guardians, client) = setup_with_guardians(3);
-        client.set_recovery_config(&admin, &2u32, &10u32);
+        client.set_recovery_config(&admin, &2u32, &GlobeWallet::MIN_RECOVERY_DELAY_LEDGERS);
         let new_admin = Address::generate(&env);
 
         client.initiate_recovery(&guardians.get(0).unwrap(), &new_admin);
@@ -2536,7 +2712,8 @@ mod tests {
             Err(Ok(WalletError::RecoveryNotReady))
         );
 
-        env.ledger().with_mut(|l| l.sequence_number += 10);
+        env.ledger()
+            .with_mut(|l| l.sequence_number += GlobeWallet::MIN_RECOVERY_DELAY_LEDGERS);
         client.execute_recovery();
         assert_eq!(client.admin(), new_admin);
         assert!(client.recovery_proposal().is_none());
@@ -2545,7 +2722,7 @@ mod tests {
     #[test]
     fn test_recovery_rejects_non_guardian() {
         let (env, admin, _guardians, client) = setup_with_guardians(3);
-        client.set_recovery_config(&admin, &2u32, &10u32);
+        client.set_recovery_config(&admin, &2u32, &GlobeWallet::MIN_RECOVERY_DELAY_LEDGERS);
         let stranger = Address::generate(&env);
         let new_admin = Address::generate(&env);
         assert_eq!(
@@ -2557,7 +2734,7 @@ mod tests {
     #[test]
     fn test_admin_can_cancel_recovery_even_after_quorum() {
         let (env, admin, guardians, client) = setup_with_guardians(3);
-        client.set_recovery_config(&admin, &2u32, &10u32);
+        client.set_recovery_config(&admin, &2u32, &GlobeWallet::MIN_RECOVERY_DELAY_LEDGERS);
         let new_admin = Address::generate(&env);
 
         client.initiate_recovery(&guardians.get(0).unwrap(), &new_admin);
@@ -2578,12 +2755,13 @@ mod tests {
     #[test]
     fn test_revoking_approval_below_threshold_resets_timelock() {
         let (env, admin, guardians, client) = setup_with_guardians(3);
-        client.set_recovery_config(&admin, &2u32, &10u32);
+        client.set_recovery_config(&admin, &2u32, &GlobeWallet::MIN_RECOVERY_DELAY_LEDGERS);
         let new_admin = Address::generate(&env);
 
         client.initiate_recovery(&guardians.get(0).unwrap(), &new_admin);
         client.approve_recovery(&guardians.get(1).unwrap());
-        env.ledger().with_mut(|l| l.sequence_number += 10);
+        env.ledger()
+            .with_mut(|l| l.sequence_number += GlobeWallet::MIN_RECOVERY_DELAY_LEDGERS);
 
         // A guardian has second thoughts and revokes right as the timelock
         // would otherwise have expired.
@@ -2599,7 +2777,8 @@ mod tests {
             client.try_execute_recovery(),
             Err(Ok(WalletError::RecoveryNotReady))
         );
-        env.ledger().with_mut(|l| l.sequence_number += 10);
+        env.ledger()
+            .with_mut(|l| l.sequence_number += GlobeWallet::MIN_RECOVERY_DELAY_LEDGERS);
         client.execute_recovery();
         assert_eq!(client.admin(), new_admin);
     }
@@ -2607,7 +2786,7 @@ mod tests {
     #[test]
     fn test_double_approval_rejected() {
         let (env, admin, guardians, client) = setup_with_guardians(3);
-        client.set_recovery_config(&admin, &2u32, &10u32);
+        client.set_recovery_config(&admin, &2u32, &GlobeWallet::MIN_RECOVERY_DELAY_LEDGERS);
         let new_admin = Address::generate(&env);
         client.initiate_recovery(&guardians.get(0).unwrap(), &new_admin);
         assert_eq!(
@@ -2619,7 +2798,7 @@ mod tests {
     #[test]
     fn test_cannot_initiate_second_recovery_while_one_pending() {
         let (env, admin, guardians, client) = setup_with_guardians(3);
-        client.set_recovery_config(&admin, &2u32, &10u32);
+        client.set_recovery_config(&admin, &2u32, &GlobeWallet::MIN_RECOVERY_DELAY_LEDGERS);
         let new_admin_a = Address::generate(&env);
         let new_admin_b = Address::generate(&env);
         client.initiate_recovery(&guardians.get(0).unwrap(), &new_admin_a);
@@ -2632,7 +2811,7 @@ mod tests {
     #[test]
     fn test_recovery_clears_any_in_flight_normal_admin_transfer() {
         let (env, admin, guardians, client) = setup_with_guardians(3);
-        client.set_recovery_config(&admin, &2u32, &10u32);
+        client.set_recovery_config(&admin, &2u32, &GlobeWallet::MIN_RECOVERY_DELAY_LEDGERS);
         let normal_candidate = Address::generate(&env);
         let recovery_admin = Address::generate(&env);
 
@@ -2642,7 +2821,8 @@ mod tests {
         // ...but the device is lost before it's accepted, so guardians recover instead.
         client.initiate_recovery(&guardians.get(0).unwrap(), &recovery_admin);
         client.approve_recovery(&guardians.get(1).unwrap());
-        env.ledger().with_mut(|l| l.sequence_number += 10);
+        env.ledger()
+            .with_mut(|l| l.sequence_number += GlobeWallet::MIN_RECOVERY_DELAY_LEDGERS);
         client.execute_recovery();
 
         assert_eq!(client.admin(), recovery_admin);
@@ -2660,11 +2840,12 @@ mod tests {
         // already-current admin must be rejected at execute_recovery time
         // rather than silently succeeding as a no-op transfer.
         let (env, admin, guardians, client) = setup_with_guardians(3);
-        client.set_recovery_config(&admin, &2u32, &10u32);
+        client.set_recovery_config(&admin, &2u32, &GlobeWallet::MIN_RECOVERY_DELAY_LEDGERS);
 
         client.initiate_recovery(&guardians.get(0).unwrap(), &admin);
         client.approve_recovery(&guardians.get(1).unwrap());
-        env.ledger().with_mut(|l| l.sequence_number += 10);
+        env.ledger()
+            .with_mut(|l| l.sequence_number += GlobeWallet::MIN_RECOVERY_DELAY_LEDGERS);
 
         assert_eq!(
             client.try_execute_recovery(),
@@ -2705,16 +2886,17 @@ mod tests {
         // AND a new, distinctly-named recovery_completed event carrying
         // enough context for a monitoring integration to act on it.
         let (env, admin, guardians, client) = setup_with_guardians(3);
-        client.set_recovery_config(&admin, &2u32, &10u32);
+        client.set_recovery_config(&admin, &2u32, &GlobeWallet::MIN_RECOVERY_DELAY_LEDGERS);
 
         let new_admin = Address::generate(&env);
         client.initiate_recovery(&guardians.get(0).unwrap(), &new_admin);
         client.approve_recovery(&guardians.get(1).unwrap());
         // Quorum (2) reached on this second approval; ready_at was armed as
-        // current_sequence + 10 inside approve_recovery. Advance exactly to
-        // that boundary so this test also pins the inclusive `>=` semantics
-        // execute_recovery's `env.ledger().sequence() < ready_at` check
-        // implies, rather than overshooting and leaving that untested.
+        // current_sequence + MIN_RECOVERY_DELAY_LEDGERS inside approve_recovery.
+        // Advance exactly to that boundary so this test also pins the
+        // inclusive `>=` semantics execute_recovery's
+        // `env.ledger().sequence() < ready_at` check implies, rather than
+        // overshooting and leaving that untested.
         let ready_at = client.recovery_proposal().unwrap().ready_at.unwrap();
         env.ledger().with_mut(|l| l.sequence_number = ready_at);
 
@@ -2757,7 +2939,7 @@ mod tests {
         // wallet recovered at its bare 3-guardian threshold, and this field
         // is what lets a monitoring integration tell the two apart.
         let (env, admin, guardians, client) = setup_with_guardians(5);
-        client.set_recovery_config(&admin, &3u32, &5u32);
+        client.set_recovery_config(&admin, &3u32, &GlobeWallet::MIN_RECOVERY_DELAY_LEDGERS);
 
         let new_admin = Address::generate(&env);
         client.initiate_recovery(&guardians.get(0).unwrap(), &new_admin);
@@ -2810,7 +2992,7 @@ mod tests {
         // rejected outright rather than silently interacting with an
         // in-flight proposal's frozen `ready_at` / live `threshold` check.
         let (env, admin, guardians, client) = setup_with_guardians(3);
-        client.set_recovery_config(&admin, &2u32, &10u32);
+        client.set_recovery_config(&admin, &2u32, &GlobeWallet::MIN_RECOVERY_DELAY_LEDGERS);
         let new_admin = Address::generate(&env);
         client.initiate_recovery(&guardians.get(0).unwrap(), &new_admin);
 
@@ -2822,14 +3004,17 @@ mod tests {
         // Config is unchanged.
         let config = client.recovery_config().unwrap();
         assert_eq!(config.threshold, 2);
-        assert_eq!(config.delay_in_ledgers, 10);
+        assert_eq!(config.delay_in_ledgers, GlobeWallet::MIN_RECOVERY_DELAY_LEDGERS);
 
         // Cancelling the pending recovery unblocks reconfiguration again.
         client.cancel_recovery(&admin);
-        client.set_recovery_config(&admin, &3u32, &5u32);
+        client.set_recovery_config(&admin, &3u32, &(GlobeWallet::MIN_RECOVERY_DELAY_LEDGERS + 1));
         let config = client.recovery_config().unwrap();
         assert_eq!(config.threshold, 3);
-        assert_eq!(config.delay_in_ledgers, 5);
+        assert_eq!(
+            config.delay_in_ledgers,
+            GlobeWallet::MIN_RECOVERY_DELAY_LEDGERS + 1
+        );
     }
 
     #[test]
