@@ -162,7 +162,7 @@ pub enum WalletError {
     GuardianNotFound = 1019,
     /// Recovery threshold must be `1 < threshold <= guardians.len()`.
     InvalidRecoveryThreshold = 1020,
-    /// `add_guardian`/`set_recovery_config` would leave threshold >
+    /// `set_recovery_config`/`remove_guardian` would leave threshold >
     /// guardian count, or guardians.len() below the required minimum.
     NotEnoughGuardians = 1021,
     /// No recovery threshold/delay configured yet — call `set_recovery_config` first.
@@ -203,7 +203,7 @@ impl GlobeWallet {
     /// Minimum number of guardians a wallet must have before a recovery
     /// threshold can be configured. Below this, "M-of-N social recovery"
     /// degenerates into "one or two people can unilaterally seize the wallet".
-    const MIN_GUARDIANS_FOR_RECOVERY: u32 = 3;
+    pub const MIN_GUARDIANS_FOR_RECOVERY: u32 = 3;
 
     /// Maximum guardians a wallet may register — mirrors [`Self::MAX_ASSETS`]'s
     /// rationale but for storage-*mutation* cost rather than raw storage size
@@ -490,7 +490,8 @@ impl GlobeWallet {
     ///
     /// # Errors
     /// * [`WalletError::NotEnoughGuardians`] — would drop the guardian count
-    ///   below the configured recovery threshold.
+    ///   below the configured recovery threshold or below
+    ///   [`Self::MIN_GUARDIANS_FOR_RECOVERY`] while recovery is configured.
     ///
     /// ## Scan cost (issue #45)
     /// This function's rebuild loop below, and `revoke_recovery_approval`'s
@@ -523,7 +524,9 @@ impl GlobeWallet {
         }
         let recovery_config = Self::recovery_config(env.clone());
         if let Some(config) = &recovery_config {
-            if new_guardians.len() < config.threshold {
+            if new_guardians.len() < config.threshold
+                || new_guardians.len() < Self::MIN_GUARDIANS_FOR_RECOVERY
+            {
                 return Err(WalletError::NotEnoughGuardians);
             }
         }
@@ -1672,12 +1675,15 @@ mod tests {
         let user = Address::generate(&env);
         for i in 0..GlobeWallet::MAX_ASSETS {
             let code = String::from_str(&env, &std::format!("ASSET{}", i));
-            let asset = AssetInfo { code, issuer: None };
+            let asset = AssetInfo {
+                code,
+                issuer: Some(Address::generate(&env)),
+            };
             client.add_asset(&user, &asset);
         }
         let extra = AssetInfo {
             code: String::from_str(&env, "EXTRA"),
-            issuer: None,
+            issuer: Some(Address::generate(&env)),
         };
         assert_eq!(
             client.try_add_asset(&user, &extra),
@@ -1692,7 +1698,10 @@ mod tests {
         let mut assets: Vec<AssetInfo> = Vec::new(&env);
         for i in 0..GlobeWallet::MAX_ASSETS + 10 {
             let code = String::from_str(&env, &std::format!("ASSET{}", i));
-            assets.push_back(AssetInfo { code: code.clone(), issuer: None });
+            assets.push_back(AssetInfo {
+                code: code.clone(),
+                issuer: Some(Address::generate(&env)),
+            });
         }
         env.as_contract(&cid, || {
             env.storage()
@@ -1734,7 +1743,10 @@ mod tests {
         let user = Address::generate(&env);
         for i in 0..3 {
             let code = String::from_str(&env, &std::format!("ASSET{}", i));
-            let asset = AssetInfo { code, issuer: None };
+            let asset = AssetInfo {
+                code,
+                issuer: Some(Address::generate(&env)),
+            };
             client.add_asset(&user, &asset);
         }
         let removed = client.migrate_user_assets(&admin, &user);
@@ -1881,7 +1893,7 @@ mod tests {
         let never_uploaded_hash = BytesN::from_array(&env, &[42u8; 32]);
 
         // propose_upgrade should succeed even with an invalid hash
-        assert_eq!(client.try_propose_upgrade(&admin, &never_uploaded_hash, &0u32), Ok(()));
+        assert_eq!(client.try_propose_upgrade(&admin, &never_uploaded_hash, &0u32), Ok(Ok(())));
 
         // The proposal is stored
         let cid = id.clone();
@@ -1937,7 +1949,7 @@ mod tests {
 
     #[test]
     fn test_add_and_list_guardians() {
-        let (env, _admin, guardians, client) = setup_with_guardians(3);
+        let (_env, _admin, guardians, client) = setup_with_guardians(3);
         let stored = client.guardians();
         assert_eq!(stored.len(), 3);
         for i in 0..3 {
@@ -1983,11 +1995,51 @@ mod tests {
 
     #[test]
     fn test_remove_guardian_below_threshold_fails() {
-        let (_env, admin, guardians, client) = setup_with_guardians(3);
-        client.set_recovery_config(&admin, &3u32, &10u32);
+        let (_env, admin, guardians, client) = setup_with_guardians(4);
+        client.set_recovery_config(&admin, &4u32, &10u32);
         assert_eq!(
             client.try_remove_guardian(&admin, &guardians.get(0).unwrap()),
             Err(Ok(WalletError::NotEnoughGuardians))
+        );
+    }
+
+    #[test]
+    fn test_remove_guardian_degrades_below_min_guardians_for_recovery() {
+        let (env, _cid, admin, client) = setup();
+        let g = [
+            Address::generate(&env),
+            Address::generate(&env),
+            Address::generate(&env),
+        ];
+        for guardian in &g {
+            client.add_guardian(&admin, guardian);
+        }
+        client.set_recovery_config(&admin, &2, &10); // valid: 3 guardians >= MIN_GUARDIANS_FOR_RECOVERY, threshold 2 <= 3
+
+        assert_eq!(
+            client.try_remove_guardian(&admin, &g[2]),
+            Err(Ok(WalletError::NotEnoughGuardians))
+        );
+    }
+
+    #[test]
+    fn test_remove_guardian_without_recovery_config_succeeds_below_min_guardians() {
+        let (_env, admin, guardians, client) = setup_with_guardians(2);
+        // No recovery config set; removal from 2 down to 1 should succeed
+        client.remove_guardian(&admin, &guardians.get(0).unwrap());
+        assert_eq!(client.guardians().len(), 1);
+        assert_eq!(client.guardians().get(0).unwrap(), guardians.get(1).unwrap());
+    }
+
+    #[test]
+    fn test_remove_guardian_down_to_min_guardians_for_recovery_succeeds() {
+        let (_env, admin, guardians, client) = setup_with_guardians(4);
+        client.set_recovery_config(&admin, &2u32, &10u32);
+        // Removing 1 from 4 leaves exactly 3 (MIN_GUARDIANS_FOR_RECOVERY)
+        client.remove_guardian(&admin, &guardians.get(3).unwrap());
+        assert_eq!(
+            client.guardians().len(),
+            GlobeWallet::MIN_GUARDIANS_FOR_RECOVERY
         );
     }
 
@@ -2010,7 +2062,7 @@ mod tests {
         // guardian who already approved a pending recovery must invalidate
         // that approval, not just block them from casting *new* ones (that
         // half is already covered by `test_removed_guardian_cannot_initiate_recovery`).
-        let (env, admin, guardians, client) = setup_with_guardians(3);
+        let (env, admin, guardians, client) = setup_with_guardians(4);
         client.set_recovery_config(&admin, &2u32, &10u32);
         let new_admin = Address::generate(&env);
 
@@ -2019,9 +2071,9 @@ mod tests {
         assert!(client.recovery_proposal().unwrap().ready_at.is_some());
 
         // Admin distrusts G1 (e.g. suspects key compromise colluding on this
-        // very recovery) and removes them. 2 guardians remain (G0, G2)
-        // against threshold 2 — the NotEnoughGuardians guard passes fine,
-        // so removal itself succeeds.
+        // very recovery) and removes them. 3 guardians remain (G0, G2, G3)
+        // against threshold 2 and MIN_GUARDIANS_FOR_RECOVERY 3 — the
+        // NotEnoughGuardians guard passes fine, so removal itself succeeds.
         client.remove_guardian(&admin, &guardians.get(1).unwrap());
 
         let proposal = client.recovery_proposal().unwrap();
@@ -2072,7 +2124,7 @@ mod tests {
         // After a removal de-quorates a proposal, the remaining guardians
         // must still be able to bring it back to quorum — with a *new*
         // ready_at, not a resurrected stale one.
-        let (env, admin, guardians, client) = setup_with_guardians(3);
+        let (env, admin, guardians, client) = setup_with_guardians(4);
         client.set_recovery_config(&admin, &2u32, &10u32);
         let new_admin = Address::generate(&env);
 
@@ -2580,10 +2632,17 @@ mod tests {
 
     #[test]
     fn test_user_assets_ttl_extension_after_long_idle_period() {
-        let (env, _cid, _admin, client) = setup();
+        let (env, cid, _admin, client) = setup();
         let user = Address::generate(&env);
         client.add_asset(&user, &xlm(&env));
         client.add_asset(&user, &usdc(&env));
+
+        // Keep contract instance alive so only the persistent entry TTL is under test
+        env.as_contract(&cid, || {
+            env.storage()
+                .instance()
+                .extend_ttl(PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND_TO);
+        });
 
         // Jump well past the default persistent-entry TTL (4096 ledgers).
         // Without extend_ttl, the entry's default TTL would have expired
@@ -2597,10 +2656,18 @@ mod tests {
 
     #[test]
     fn test_spend_limit_ttl_extension_after_long_idle_period() {
-        let (env, _cid, _admin, client) = setup();
+        let (env, cid, _admin, client) = setup();
         let user = Address::generate(&env);
         let code = String::from_str(&env, "XLM");
+        client.add_asset(&user, &xlm(&env));
         client.set_spend_limit(&user, &code, &1_000_000_i128);
+
+        // Keep contract instance alive so only the persistent entry TTL is under test
+        env.as_contract(&cid, || {
+            env.storage()
+                .instance()
+                .extend_ttl(PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND_TO);
+        });
 
         // Jump well past default persistent-entry TTL.
         env.ledger().with_mut(|l| l.sequence_number += 50_000);
