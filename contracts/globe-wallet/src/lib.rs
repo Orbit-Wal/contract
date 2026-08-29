@@ -939,6 +939,10 @@ impl GlobeWallet {
 
     /// Remove an asset from a user's wallet registry.
     ///
+    /// Cleans up any associated `SpendLimit` and `DailySpent` entries for this
+    /// asset so orphaned storage is reclaimed and subsequent re-additions
+    /// start with fresh unconfigured limits.
+    ///
     /// # Errors
     /// * [`WalletError::AssetNotFound`] — asset code not registered.
     pub fn remove_asset(env: Env, user: Address, asset_code: String) -> Result<(), WalletError> {
@@ -969,6 +973,12 @@ impl GlobeWallet {
             PERSISTENT_TTL_THRESHOLD,
             PERSISTENT_TTL_EXTEND_TO,
         );
+        env.storage()
+            .persistent()
+            .remove(&DataKey::SpendLimit(user.clone(), asset_code.clone()));
+        env.storage()
+            .persistent()
+            .remove(&DataKey::DailySpent(user.clone(), asset_code.clone()));
         env.events()
             .publish((Symbol::new(&env, "asset_removed"),), (user, asset_code));
         Ok(())
@@ -1406,6 +1416,66 @@ mod tests {
     }
 
     #[test]
+    fn test_remove_asset_cleans_up_spend_limit_and_daily_spent() {
+        let (env, cid, _admin, client) = setup();
+        let user = Address::generate(&env);
+        let code = String::from_str(&env, "USDC");
+        client.add_asset(&user, &usdc(&env));
+        client.set_spend_limit(&user, &code, &500_i128);
+        client.record_spend(&user, &code, &200_i128);
+
+        // Verify limit and spent records are established
+        assert_eq!(client.get_spend_limit(&user, &code), 500);
+        env.as_contract(&cid, || {
+            assert!(env.storage().persistent().has(&DataKey::SpendLimit(user.clone(), code.clone())));
+            assert!(env.storage().persistent().has(&DataKey::DailySpent(user.clone(), code.clone())));
+        });
+
+        // Remove the asset
+        client.remove_asset(&user, &code);
+        assert_eq!(client.get_assets(&user).len(), 0);
+
+        // Spend limit returns to default (0 / unlimited)
+        assert_eq!(client.get_spend_limit(&user, &code), 0);
+
+        // Verify storage keys for SpendLimit and DailySpent were cleaned up
+        env.as_contract(&cid, || {
+            assert!(!env.storage().persistent().has(&DataKey::SpendLimit(user.clone(), code.clone())));
+            assert!(!env.storage().persistent().has(&DataKey::DailySpent(user.clone(), code.clone())));
+        });
+    }
+
+    #[test]
+    fn test_readding_previously_removed_asset_has_fresh_unconfigured_limit() {
+        let (env, _cid, _admin, client) = setup();
+        let user = Address::generate(&env);
+        let code = String::from_str(&env, "USDC");
+        client.add_asset(&user, &usdc(&env));
+        client.set_spend_limit(&user, &code, &500_i128);
+        client.record_spend(&user, &code, &200_i128);
+
+        // Remove the asset
+        client.remove_asset(&user, &code);
+        assert_eq!(client.get_assets(&user).len(), 0);
+        assert_eq!(client.get_spend_limit(&user, &code), 0);
+
+        // Re-add the same asset
+        client.add_asset(&user, &usdc(&env));
+        assert_eq!(client.get_assets(&user).len(), 1);
+
+        // The re-added asset starts with fresh unconfigured limit (0 = unlimited),
+        // rather than inheriting the old 500 limit
+        assert_eq!(client.get_spend_limit(&user, &code), 0);
+
+        // Since limit is 0 (unlimited), spending beyond the old 500 limit succeeds
+        assert_eq!(client.try_record_spend(&user, &code, &1000_i128), Ok(Ok(())));
+
+        // User can now configure a fresh spend limit from a clean slate
+        client.set_spend_limit(&user, &code, &2000_i128);
+        assert_eq!(client.get_spend_limit(&user, &code), 2000);
+    }
+
+    #[test]
     fn test_spend_limit_set_and_get() {
         let (env, _cid, _admin, client) = setup();
         let user = Address::generate(&env);
@@ -1672,12 +1742,15 @@ mod tests {
         let user = Address::generate(&env);
         for i in 0..GlobeWallet::MAX_ASSETS {
             let code = String::from_str(&env, &std::format!("ASSET{}", i));
-            let asset = AssetInfo { code, issuer: None };
+            let asset = AssetInfo {
+                code,
+                issuer: Some(Address::generate(&env)),
+            };
             client.add_asset(&user, &asset);
         }
         let extra = AssetInfo {
             code: String::from_str(&env, "EXTRA"),
-            issuer: None,
+            issuer: Some(Address::generate(&env)),
         };
         assert_eq!(
             client.try_add_asset(&user, &extra),
@@ -1692,7 +1765,10 @@ mod tests {
         let mut assets: Vec<AssetInfo> = Vec::new(&env);
         for i in 0..GlobeWallet::MAX_ASSETS + 10 {
             let code = String::from_str(&env, &std::format!("ASSET{}", i));
-            assets.push_back(AssetInfo { code: code.clone(), issuer: None });
+            assets.push_back(AssetInfo {
+                code: code.clone(),
+                issuer: Some(Address::generate(&env)),
+            });
         }
         env.as_contract(&cid, || {
             env.storage()
@@ -1734,7 +1810,10 @@ mod tests {
         let user = Address::generate(&env);
         for i in 0..3 {
             let code = String::from_str(&env, &std::format!("ASSET{}", i));
-            let asset = AssetInfo { code, issuer: None };
+            let asset = AssetInfo {
+                code,
+                issuer: Some(Address::generate(&env)),
+            };
             client.add_asset(&user, &asset);
         }
         let removed = client.migrate_user_assets(&admin, &user);
@@ -1881,7 +1960,7 @@ mod tests {
         let never_uploaded_hash = BytesN::from_array(&env, &[42u8; 32]);
 
         // propose_upgrade should succeed even with an invalid hash
-        assert_eq!(client.try_propose_upgrade(&admin, &never_uploaded_hash, &0u32), Ok(()));
+        assert_eq!(client.try_propose_upgrade(&admin, &never_uploaded_hash, &0u32), Ok(Ok(())));
 
         // The proposal is stored
         let cid = id.clone();
@@ -2580,10 +2659,17 @@ mod tests {
 
     #[test]
     fn test_user_assets_ttl_extension_after_long_idle_period() {
-        let (env, _cid, _admin, client) = setup();
+        let (env, cid, _admin, client) = setup();
         let user = Address::generate(&env);
         client.add_asset(&user, &xlm(&env));
         client.add_asset(&user, &usdc(&env));
+
+        // Keep contract instance alive so only the persistent entry TTL is under test
+        env.as_contract(&cid, || {
+            env.storage()
+                .instance()
+                .extend_ttl(PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND_TO);
+        });
 
         // Jump well past the default persistent-entry TTL (4096 ledgers).
         // Without extend_ttl, the entry's default TTL would have expired
@@ -2597,10 +2683,17 @@ mod tests {
 
     #[test]
     fn test_spend_limit_ttl_extension_after_long_idle_period() {
-        let (env, _cid, _admin, client) = setup();
+        let (env, cid, _admin, client) = setup();
         let user = Address::generate(&env);
         let code = String::from_str(&env, "XLM");
         client.set_spend_limit(&user, &code, &1_000_000_i128);
+
+        // Keep contract instance alive so only the persistent entry TTL is under test
+        env.as_contract(&cid, || {
+            env.storage()
+                .instance()
+                .extend_ttl(PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND_TO);
+        });
 
         // Jump well past default persistent-entry TTL.
         env.ledger().with_mut(|l| l.sequence_number += 50_000);
