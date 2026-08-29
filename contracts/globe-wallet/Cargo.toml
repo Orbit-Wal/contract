@@ -8,6 +8,18 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 soroban-sdk = { workspace = true }
+# Enables the `send` wiring (docs/design/wiring-reentrancy-threat-model.md) to
+# call token-wrapper::transfer_from via a real, typed `TokenWrapperClient`
+# rather than a hand-rolled `env.invoke_contract` call. Verified empirically
+# (via a wasm32-unknown-unknown release build + export-table inspection)
+# that this does NOT leak token-wrapper's own `#[contractimpl]` exports
+# (approve/transfer_from/allowance) into globe-wallet's compiled .wasm: this
+# workspace's release profile (lto = true, codegen-units = 1) correctly
+# dead-code-eliminates the unused `#[no_mangle]` wasm exports from a
+# dependency crate that the importing crate never itself registers as its
+# own `#[contract]`. Re-verify this if the release profile's LTO/
+# codegen-units settings ever change.
+token-wrapper = { path = "../token-wrapper" }
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }

@@ -20,6 +20,7 @@ use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, Address, BytesN, Env, Map, String, Symbol,
     Vec,
 };
+use token_wrapper::TokenWrapperClient;
 
 // ── Storage Keys ──────────────────────────────────────────────────────────────
 
@@ -47,6 +48,13 @@ pub enum DataKey {
     /// This is intentionally appended so the serialized values of existing
     /// storage keys remain stable across contract upgrades.
     GuardianMembership,
+    /// The token-wrapper contract instance `send` calls into. Admin-set via
+    /// `set_token_wrapper`. See docs/design/wiring-reentrancy-threat-model.md.
+    TokenWrapperId,
+    /// Admin-curated set of token contract addresses `send` is permitted to
+    /// move. Membership only — presence of the key means "allowed"; see
+    /// `add_allowed_token`/`remove_allowed_token`/`is_token_allowed`.
+    AllowedToken(Address),
 }
 
 /// `DailySpent` used to live in *temporary* storage while `SpendLimit` lives in
@@ -238,6 +246,15 @@ pub enum WalletError {
     RecoveryNewAdminUnchanged = 1032,
     /// `AssetInfo.code` is empty or exceeds `GlobeWallet::MAX_ASSET_CODE_LEN`.
     InvalidAssetCode = 1033,
+    /// `send`'s `token_id` is not on the admin-curated allowlist. See
+    /// docs/design/wiring-reentrancy-threat-model.md §4.
+    TokenNotAllowed = 1034,
+    /// `send` was called before an admin configured the token-wrapper
+    /// contract instance via `set_token_wrapper`.
+    TokenWrapperNotSet = 1035,
+    /// The `token-wrapper::transfer_from` call `send` makes failed (e.g.
+    /// insufficient/expired allowance) or could not be invoked at all.
+    TokenTransferFailed = 1036,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -1234,6 +1251,164 @@ impl GlobeWallet {
         Ok(())
     }
 
+    // ── Wiring: globe-wallet <-> token-wrapper ───────────────────────────────────
+    //
+    // See docs/design/architecture.md ("Future: wiring the contracts
+    // together") and docs/design/wiring-reentrancy-threat-model.md for the
+    // full design rationale. Summary: `send` enforces the daily spend limit
+    // (via `record_spend`, called as a direct in-frame function call — not a
+    // cross-contract invocation, so its existing reentrancy proof is
+    // unaffected) and only then calls out to `token-wrapper::transfer_from`,
+    // and only for a `token_id` the admin has explicitly allowlisted.
+
+    /// Admin: set the token-wrapper contract instance `send` calls into.
+    pub fn set_token_wrapper(env: Env, admin: Address, token_wrapper_id: Address) -> Result<(), WalletError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::TokenWrapperId, &token_wrapper_id);
+        env.events().publish(
+            (Symbol::new(&env, "token_wrapper_set"),),
+            token_wrapper_id,
+        );
+        Ok(())
+    }
+
+    /// Returns the currently configured token-wrapper contract instance, if any.
+    pub fn get_token_wrapper(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::TokenWrapperId)
+    }
+
+    /// Admin: add `token_id` to the set of tokens `send` is permitted to move.
+    ///
+    /// This is a governance/curation decision, not something this contract
+    /// can verify on-chain — the admin is expected to have confirmed
+    /// `token_id` implements the standard token interface correctly and
+    /// represents a real, valued asset before allowlisting it. See
+    /// docs/design/wiring-reentrancy-threat-model.md §4-5.
+    pub fn add_allowed_token(env: Env, admin: Address, token_id: Address) -> Result<(), WalletError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        let key = DataKey::AllowedToken(token_id.clone());
+        env.storage().persistent().set(&key, &true);
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_TTL_THRESHOLD,
+            PERSISTENT_TTL_EXTEND_TO,
+        );
+        env.events().publish(
+            (Symbol::new(&env, "token_allowed"),),
+            token_id,
+        );
+        Ok(())
+    }
+
+    /// Admin: remove `token_id` from the send-allowlist.
+    pub fn remove_allowed_token(env: Env, admin: Address, token_id: Address) -> Result<(), WalletError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        env.storage()
+            .persistent()
+            .remove(&DataKey::AllowedToken(token_id.clone()));
+        env.events().publish(
+            (Symbol::new(&env, "token_disallowed"),),
+            token_id,
+        );
+        Ok(())
+    }
+
+    /// Returns whether `token_id` is currently allowlisted for `send`.
+    pub fn is_token_allowed(env: Env, token_id: Address) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::AllowedToken(token_id))
+            .unwrap_or(false)
+    }
+
+    /// Atomically enforce the daily spend limit and move `amount` of
+    /// `token_id` from `user` to `to`, via `token-wrapper::transfer_from`.
+    ///
+    /// `user` must have already granted this contract (i.e.
+    /// `env.current_contract_address()`) an allowance over `token_id` via
+    /// `token-wrapper::approve` before calling this — matching
+    /// `docs/design/architecture.md`'s intended integration flow.
+    ///
+    /// # Errors
+    /// * [`WalletError::TokenNotAllowed`] if `token_id` is not allowlisted.
+    /// * [`WalletError::TokenWrapperNotSet`] if no admin has configured the
+    ///   token-wrapper instance yet.
+    /// * [`WalletError::SpendLimitExceeded`] / [`WalletError::SpendOverflow`]
+    ///   per `record_spend`'s existing rules.
+    ///
+    /// A failure at any step reverts the whole call, including any
+    /// `record_spend` write already applied in this same invocation —
+    /// Soroban transactions are all-or-nothing, so there is no path where
+    /// the daily counter advances without the underlying transfer actually
+    /// succeeding (or vice versa).
+    pub fn send(
+        env: Env,
+        user: Address,
+        token_id: Address,
+        asset_code: String,
+        to: Address,
+        amount: i128,
+    ) -> Result<(), WalletError> {
+        // NOTE: `user` is authorized by `record_spend`'s own `require_auth`
+        // call below, not here — Soroban's auth framework treats a second
+        // `require_auth` for the same address within the same frame as
+        // re-authorizing an already-authorized signer (`Auth,
+        // ExistingValue` / "frame is already authorized"), so this function
+        // must not call it a second time itself.
+
+        // 1. Allowlist check — see threat-model doc §4, mitigation 1. Done
+        //    first and before any state mutation so a disallowed token_id
+        //    never touches the daily-spend counter at all. This does not
+        //    require authorization, so it's safe to run before `user` is
+        //    authorized by the record_spend call below.
+        if !Self::is_token_allowed(env.clone(), token_id.clone()) {
+            return Err(WalletError::TokenNotAllowed);
+        }
+
+        // 2. Effects: finalize every one of globe-wallet's own state changes
+        //    for this operation before the one external call below. This is
+        //    a plain associated-function call (same host frame), so
+        //    record_spend's existing reentrancy proof
+        //    (docs/record-spend-reentrancy.md) is untouched by this wiring.
+        Self::record_spend(env.clone(), user.clone(), asset_code, amount)?;
+
+        let wrapper_id: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::TokenWrapperId)
+            .ok_or(WalletError::TokenWrapperNotSet)?;
+
+        // 3. Interaction: the one external call in this function, made last.
+        //    See threat-model doc §3 for why neither token-wrapper nor an
+        //    adversarial token_id can call back into GlobeWallet (or into
+        //    token-wrapper itself) while this frame is on the stack, and
+        //    `test_send_rejects_reentrant_malicious_token` for the
+        //    executable proof against a real mock malicious token contract.
+        let wrapper_client = TokenWrapperClient::new(&env, &wrapper_id);
+        match wrapper_client.try_transfer_from(
+            &env.current_contract_address(),
+            &token_id,
+            &user,
+            &to,
+            &amount,
+        ) {
+            Ok(Ok(())) => Ok(()),
+            // Ok(Err(_)): token-wrapper returned a typed WrapperError (bad
+            // allowance, invalid amount, ...). Err(_): the call couldn't be
+            // completed at all (e.g. conversion/invoke-level failure). Both
+            // collapse to one WalletError — the specific WrapperError is
+            // still visible in the transaction's diagnostic events for
+            // debugging, and either way the whole transaction (including
+            // the record_spend write above) reverts.
+            Ok(Err(_)) | Err(_) => Err(WalletError::TokenTransferFailed),
+        }
+    }
+
     // ── Migration ───────────────────────────────────────────────────────────────
 
     /// Admin and user: trim a user's asset list to [`GlobeWallet::MAX_ASSETS`] if it exceeds the bound.
@@ -2046,7 +2221,10 @@ mod tests {
         let never_uploaded_hash = BytesN::from_array(&env, &[42u8; 32]);
 
         // propose_upgrade should succeed even with an invalid hash
-        assert_eq!(client.try_propose_upgrade(&admin, &never_uploaded_hash, &0u32), Ok(Ok(())));
+        assert_eq!(
+            client.try_propose_upgrade(&admin, &never_uploaded_hash, &0u32),
+            Ok(Ok(()))
+        );
 
         // The proposal is stored
         let cid = id.clone();
@@ -2897,6 +3075,252 @@ mod tests {
         // Jump well past default persistent-entry TTL.
         env.ledger().with_mut(|l| l.sequence_number += 50_000);
 
+        assert_eq!(client.get_spend_limit(&user, &code), 1_000_000);
+    }
+
+    // ── Wiring: globe-wallet <-> token-wrapper ───────────────────────────────
+    //
+    // See docs/design/wiring-reentrancy-threat-model.md for the full design
+    // rationale these tests exercise.
+
+    fn setup_wiring() -> (Env, Address, Address, GlobeWalletClient<'static>, token_wrapper::TokenWrapperClient<'static>) {
+        let (env, wallet_id, admin, client) = setup();
+        let wrapper_id = env.register_contract(None, token_wrapper::TokenWrapper);
+        let wrapper_client = token_wrapper::TokenWrapperClient::new(&env, &wrapper_id);
+        client.set_token_wrapper(&admin, &wrapper_id);
+        (env, wallet_id, admin, client, wrapper_client)
+    }
+
+    fn create_real_token<'a>(env: &Env, admin: &Address) -> (Address, soroban_sdk::token::StellarAssetClient<'a>, soroban_sdk::token::Client<'a>) {
+        let sac = env.register_stellar_asset_contract_v2(admin.clone());
+        let address = sac.address();
+        (
+            address.clone(),
+            soroban_sdk::token::StellarAssetClient::new(env, &address),
+            soroban_sdk::token::Client::new(env, &address),
+        )
+    }
+
+    #[test]
+    fn test_send_happy_path_moves_tokens_and_records_spend() {
+        let (env, wallet_id, admin, client, wrapper_client) = setup_wiring();
+        let token_admin = Address::generate(&env);
+        let user = Address::generate(&env);
+        let to = Address::generate(&env);
+        let code = String::from_str(&env, "XLM");
+        let (token_id, token_admin_client, token) = create_real_token(&env, &token_admin);
+        token_admin_client.mint(&user, &1_000);
+
+        client.add_allowed_token(&admin, &token_id);
+        client.set_spend_limit(&user, &code, &500_i128);
+
+        env.ledger().with_mut(|l| l.sequence_number = 100);
+        wrapper_client.approve(&user, &wallet_id, &500, &10_000);
+
+        client.send(&user, &token_id, &code, &to, &200);
+
+        assert_eq!(token.balance(&user), 800);
+        assert_eq!(token.balance(&to), 200);
+        assert_eq!(wrapper_client.allowance(&user, &wallet_id).amount, 300);
+    }
+
+    #[test]
+    fn test_send_rejects_disallowed_token() {
+        let (env, _wallet_id, _admin, client, _wrapper_client) = setup_wiring();
+        let user = Address::generate(&env);
+        let to = Address::generate(&env);
+        let code = String::from_str(&env, "XLM");
+        let token_admin = Address::generate(&env);
+        let (token_id, _token_admin_client, _token) = create_real_token(&env, &token_admin);
+        // Deliberately NOT allowlisted.
+
+        assert_eq!(
+            client.try_send(&user, &token_id, &code, &to, &100),
+            Err(Ok(WalletError::TokenNotAllowed))
+        );
+    }
+
+    #[test]
+    fn test_send_rejects_when_token_wrapper_not_set() {
+        let (env, _cid, admin, client) = setup();
+        let user = Address::generate(&env);
+        let to = Address::generate(&env);
+        let code = String::from_str(&env, "XLM");
+        let token_admin = Address::generate(&env);
+        let (token_id, _token_admin_client, _token) = create_real_token(&env, &token_admin);
+        client.add_allowed_token(&admin, &token_id);
+        // Deliberately never called set_token_wrapper.
+
+        assert_eq!(
+            client.try_send(&user, &token_id, &code, &to, &100),
+            Err(Ok(WalletError::TokenWrapperNotSet))
+        );
+    }
+
+    #[test]
+    fn test_send_over_daily_limit_fails_and_moves_no_tokens() {
+        // Proves CEI ordering in practice: record_spend (the check) runs and
+        // fails BEFORE transfer_from (the interaction) is ever attempted, so
+        // a rejected send has zero effect on real token balances.
+        let (env, wallet_id, admin, client, wrapper_client) = setup_wiring();
+        let token_admin = Address::generate(&env);
+        let user = Address::generate(&env);
+        let to = Address::generate(&env);
+        let code = String::from_str(&env, "XLM");
+        let (token_id, token_admin_client, token) = create_real_token(&env, &token_admin);
+        token_admin_client.mint(&user, &1_000);
+
+        client.add_allowed_token(&admin, &token_id);
+        client.set_spend_limit(&user, &code, &100_i128);
+
+        env.ledger().with_mut(|l| l.sequence_number = 100);
+        wrapper_client.approve(&user, &wallet_id, &500, &10_000);
+
+        assert_eq!(
+            client.try_send(&user, &token_id, &code, &to, &200),
+            Err(Ok(WalletError::SpendLimitExceeded))
+        );
+        assert_eq!(token.balance(&user), 1_000, "no tokens should move on a rejected send");
+        assert_eq!(token.balance(&to), 0);
+        assert_eq!(
+            wrapper_client.allowance(&user, &wallet_id).amount,
+            500,
+            "allowance must be untouched — transfer_from was never reached"
+        );
+    }
+
+    #[test]
+    fn test_add_allowed_token_requires_admin() {
+        let (env, _wallet_id, _admin, client, _wrapper_client) = setup_wiring();
+        let non_admin = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let (token_id, _tac, _t) = create_real_token(&env, &token_admin);
+        assert_eq!(
+            client.try_add_allowed_token(&non_admin, &token_id),
+            Err(Ok(WalletError::Unauthorized))
+        );
+        assert!(!client.is_token_allowed(&token_id));
+    }
+
+    #[test]
+    fn test_remove_allowed_token() {
+        let (env, _wallet_id, admin, client, _wrapper_client) = setup_wiring();
+        let token_admin = Address::generate(&env);
+        let (token_id, _tac, _t) = create_real_token(&env, &token_admin);
+        client.add_allowed_token(&admin, &token_id);
+        assert!(client.is_token_allowed(&token_id));
+        client.remove_allowed_token(&admin, &token_id);
+        assert!(!client.is_token_allowed(&token_id));
+    }
+
+    #[test]
+    fn test_set_token_wrapper_requires_admin() {
+        let (env, _cid, _admin, client) = setup();
+        let non_admin = Address::generate(&env);
+        let wrapper_id = Address::generate(&env);
+        assert_eq!(
+            client.try_set_token_wrapper(&non_admin, &wrapper_id),
+            Err(Ok(WalletError::Unauthorized))
+        );
+        assert_eq!(client.get_token_wrapper(), None);
+    }
+
+    // ── The centerpiece: a real, adversarial mock token contract ─────────────
+    //
+    // `MaliciousToken` implements just enough of the standard token
+    // interface (`transfer`) for `token-wrapper::transfer_from`'s
+    // `token::Client::transfer` call to route to it — exactly as it would
+    // for any real SAC, since token_id is caller-supplied and unconstrained
+    // beyond the allowlist check. Its `transfer` implementation, instead of
+    // moving any value, immediately tries to call back into
+    // `GlobeWallet::record_spend` for the same (victim, asset_code) pair —
+    // the exact double-count scenario issue #92 describes. If Soroban's
+    // reentry protection did not hold for this 3-hop chain, that call would
+    // succeed and the assertions below would catch the resulting
+    // double-counted DailySpent entry.
+
+    #[contract]
+    pub struct MaliciousToken;
+
+    #[contractimpl]
+    impl MaliciousToken {
+        pub fn init(env: Env, wallet_id: Address, victim: Address, asset_code: String) {
+            env.storage().instance().set(&Symbol::new(&env, "wallet"), &wallet_id);
+            env.storage().instance().set(&Symbol::new(&env, "victim"), &victim);
+            env.storage().instance().set(&Symbol::new(&env, "code"), &asset_code);
+        }
+
+        /// Matches the standard token interface's `transfer` signature so
+        /// `token::Client::transfer` (called by token-wrapper) routes here.
+        pub fn transfer(env: Env, _from: Address, _to: Address, amount: i128) {
+            let wallet_id: Address = env.storage().instance().get(&Symbol::new(&env, "wallet")).unwrap();
+            let victim: Address = env.storage().instance().get(&Symbol::new(&env, "victim")).unwrap();
+            let code: String = env.storage().instance().get(&Symbol::new(&env, "code")).unwrap();
+            // Attempt the exact reentrant callback issue #92 describes: a
+            // second record_spend for the same (victim, asset_code) pair,
+            // from inside the token's own transfer, before the outer
+            // send/transfer_from call chain has unwound. Per
+            // docs/design/wiring-reentrancy-threat-model.md §3.1, the host
+            // must reject this because GlobeWallet's frame (the root of this
+            // whole call chain) is still active on the stack.
+            let victim_client = GlobeWalletClient::new(&env, &wallet_id);
+            victim_client.record_spend(&victim, &code, &amount);
+            // If we ever get here, the reentrant call above did NOT panic —
+            // i.e. reentry protection failed to hold. Nothing further to do;
+            // the test asserts on the resulting DailySpent state instead of
+            // relying on this being unreachable, so a silent protocol change
+            // that made this callback a no-op would still be caught.
+        }
+    }
+
+    #[test]
+    fn test_send_rejects_reentrant_malicious_token() {
+        let (env, wallet_id, admin, client) = setup();
+        let wrapper_id = env.register_contract(None, token_wrapper::TokenWrapper);
+        let wrapper_client = token_wrapper::TokenWrapperClient::new(&env, &wrapper_id);
+        client.set_token_wrapper(&admin, &wrapper_id);
+
+        let user = Address::generate(&env);
+        let to = Address::generate(&env);
+        let code = String::from_str(&env, "XLM");
+
+        let evil_id = env.register_contract(None, MaliciousToken);
+        let evil_client = MaliciousTokenClient::new(&env, &evil_id);
+        evil_client.init(&wallet_id, &user, &code);
+
+        client.add_allowed_token(&admin, &evil_id);
+        client.set_spend_limit(&user, &code, &1_000_000_i128);
+
+        env.ledger().with_mut(|l| l.sequence_number = 100);
+        wrapper_client.approve(&user, &wallet_id, &1_000, &10_000);
+
+        // The reentrant callback inside MaliciousToken::transfer must be
+        // rejected by the host, which must fail transfer_from's call into
+        // it, which must fail send() as a whole — never a silent success.
+        let result = client.try_send(&user, &evil_id, &code, &to, &100);
+        assert!(
+            result.is_err(),
+            "send() must fail when the token contract attempts to re-enter GlobeWallet, not silently succeed"
+        );
+
+        // And the transaction-atomicity guarantee: since the whole call
+        // failed, record_spend's own (legitimate) write inside `send` must
+        // also have been rolled back — not just the reentrant one. There
+        // must be no DailySpent entry at all, proving neither the intended
+        // spend nor a reentrant double-spend was left committed.
+        env.as_contract(&wallet_id, || {
+            let key = DataKey::DailySpent(user.clone(), code.clone());
+            let record: Option<SpendRecord> = env.storage().persistent().get(&key);
+            assert!(
+                record.is_none(),
+                "no DailySpent entry should survive a fully-reverted transaction; found {:?}",
+                record
+            );
+        });
+
+        // The spend limit configuration itself (untouched by this call
+        // either way) confirms setup was correct and we're not passing
+        // vacuously because the limit was never configured.
         assert_eq!(client.get_spend_limit(&user, &code), 1_000_000);
     }
 }
