@@ -94,7 +94,7 @@ Soroban token interface, enabling the globe-wallet contract to move tokens
 on behalf of users within a session allowance.
 
 > **Important:** `approve` uses **overwrite** semantics — calling it again
-> for the same `(owner, spender)` pair **replaces** the previous allowance
+> for the same `(owner, spender, token_id)` tuple **replaces** the previous allowance
 > rather than adding to it. See the function's doc comment for details.
 >
 > See **[docs/design/architecture.md](docs/design/architecture.md)** for how
@@ -111,7 +111,7 @@ on behalf of users within a session allowance.
 | globe-wallet | `asset_removed` | (user, asset_code) |
 | globe-wallet | `spend_limit_set` | (user, asset_code, limit) |
 | globe-wallet | `spend_recorded` | (user, asset_code, amount, total, limit) |
-| token-wrapper | `approved` | (owner, spender, amount, expiry) |
+| token-wrapper | `approved` | (owner, spender, token_id, amount, expiry) |
 | token-wrapper | `transfer_from` | (spender, from, to, amount) |
 
 ## Related Repos

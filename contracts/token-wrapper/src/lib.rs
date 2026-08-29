@@ -13,8 +13,8 @@ use soroban_sdk::{
 
 #[contracttype]
 pub enum DataKey {
-    /// (owner, spender) → (amount, expiry_ledger)
-    Allowance(Address, Address),
+    /// (owner, spender, token_id) → (amount, expiry_ledger)
+    Allowance(Address, Address, Address),
 }
 
 #[contracttype]
@@ -46,13 +46,13 @@ pub struct TokenWrapper;
 
 #[contractimpl]
 impl TokenWrapper {
-    /// Grant a spender allowance over the caller's tokens.
+    /// Grant a spender allowance over the caller's tokens for a specific asset.
     ///
     /// **Overwrite semantics:** calling `approve` for an existing
-    /// `(owner, spender)` pair **replaces** the previous allowance
+    /// `(owner, spender, token_id)` tuple **replaces** the previous allowance
     /// wholesale — it does **not** add to the remaining balance.
     /// If a spender has already used part of their allowance and
-    /// the owner calls `approve` again, the new `amount` becomes the
+    /// the owner calls `approve` again for the same token, the new `amount` becomes the
     /// *total* allowance, not an increment on top of what's left.
     ///
     /// `expiry_ledger` must be in the future.
@@ -60,6 +60,7 @@ impl TokenWrapper {
         env: Env,
         owner: Address,
         spender: Address,
+        token_id: Address,
         amount: i128,
         expiry_ledger: u32,
     ) -> Result<(), WrapperError> {
@@ -70,7 +71,7 @@ impl TokenWrapper {
         if expiry_ledger <= env.ledger().sequence() {
             return Err(WrapperError::InvalidExpiry);
         }
-        let key = DataKey::Allowance(owner.clone(), spender.clone());
+        let key = DataKey::Allowance(owner.clone(), spender.clone(), token_id.clone());
         env.storage()
             .persistent()
             .set(&key, &Allowance { amount, expiry_ledger });
@@ -81,14 +82,14 @@ impl TokenWrapper {
         env.storage().persistent().extend_ttl(&key, extend_to, extend_to);
         env.events().publish(
             (Symbol::new(&env, "approved"),),
-            (owner, spender, amount, expiry_ledger),
+            (owner, spender, token_id, amount, expiry_ledger),
         );
         Ok(())
     }
 
-    /// Return current allowance for (owner, spender).
-    pub fn allowance(env: Env, owner: Address, spender: Address) -> Allowance {
-        let key = DataKey::Allowance(owner, spender);
+    /// Return current allowance for (owner, spender, token_id).
+    pub fn allowance(env: Env, owner: Address, spender: Address, token_id: Address) -> Allowance {
+        let key = DataKey::Allowance(owner, spender, token_id);
         env.storage()
             .persistent()
             .get(&key)
@@ -111,7 +112,7 @@ impl TokenWrapper {
         if amount <= 0 {
             return Err(WrapperError::InvalidAmount);
         }
-        let key = DataKey::Allowance(from.clone(), spender.clone());
+        let key = DataKey::Allowance(from.clone(), spender.clone(), token_id.clone());
         let current: Allowance = env
             .storage()
             .persistent()
@@ -171,11 +172,13 @@ mod tests {
     #[test]
     fn test_approve_and_allowance() {
         let (env, _id, client) = setup();
+        let admin = Address::generate(&env);
         let owner = Address::generate(&env);
         let spender = Address::generate(&env);
+        let (token_id, _token_admin, _token) = create_token_contract(&env, &admin);
         env.ledger().with_mut(|l| l.sequence_number = 100);
-        client.approve(&owner, &spender, &1_000, &200);
-        let a = client.allowance(&owner, &spender);
+        client.approve(&owner, &spender, &token_id, &1_000, &200);
+        let a = client.allowance(&owner, &spender, &token_id);
         assert_eq!(a.amount, 1_000);
         assert_eq!(a.expiry_ledger, 200);
     }
@@ -183,10 +186,12 @@ mod tests {
     #[test]
     fn test_allowance_unset_pair_returns_zero() {
         let (env, _id, client) = setup();
+        let admin = Address::generate(&env);
         let owner = Address::generate(&env);
         let spender = Address::generate(&env);
+        let (token_id, _token_admin, _token) = create_token_contract(&env, &admin);
         // Cold read: never approved — hits unwrap_or default branch.
-        let a = client.allowance(&owner, &spender);
+        let a = client.allowance(&owner, &spender, &token_id);
         assert_eq!(a.amount, 0);
         assert_eq!(a.expiry_ledger, 0);
     }
@@ -194,11 +199,13 @@ mod tests {
     #[test]
     fn test_approve_negative_amount_fails() {
         let (env, _id, client) = setup();
+        let admin = Address::generate(&env);
         let owner = Address::generate(&env);
         let spender = Address::generate(&env);
+        let (token_id, _token_admin, _token) = create_token_contract(&env, &admin);
         env.ledger().with_mut(|l| l.sequence_number = 100);
         assert_eq!(
-            client.try_approve(&owner, &spender, &-1, &200),
+            client.try_approve(&owner, &spender, &token_id, &-1, &200),
             Err(Ok(WrapperError::InvalidAmount))
         );
     }
@@ -206,11 +213,13 @@ mod tests {
     #[test]
     fn test_approve_past_expiry_fails() {
         let (env, _id, client) = setup();
+        let admin = Address::generate(&env);
         let owner = Address::generate(&env);
         let spender = Address::generate(&env);
+        let (token_id, _token_admin, _token) = create_token_contract(&env, &admin);
         env.ledger().with_mut(|l| l.sequence_number = 100);
         assert_eq!(
-            client.try_approve(&owner, &spender, &1_000, &50),
+            client.try_approve(&owner, &spender, &token_id, &1_000, &50),
             Err(Ok(WrapperError::InvalidExpiry))
         );
     }
@@ -227,14 +236,14 @@ mod tests {
 
         // Grant 500 allowance and spend 300, leaving 200 remaining.
         env.ledger().with_mut(|l| l.sequence_number = 100);
-        client.approve(&owner, &spender, &500, &300);
+        client.approve(&owner, &spender, &token_id, &500, &300);
         client.transfer_from(&spender, &token_id, &owner, &to, &300);
-        let remaining = client.allowance(&owner, &spender);
+        let remaining = client.allowance(&owner, &spender, &token_id);
         assert_eq!(remaining.amount, 200);
 
-        // Calling approve again replaces (not adds to) the allowance.
-        client.approve(&owner, &spender, &500, &400);
-        let a = client.allowance(&owner, &spender);
+        // Calling approve again for the same token replaces (not adds to) the allowance.
+        client.approve(&owner, &spender, &token_id, &500, &400);
+        let a = client.allowance(&owner, &spender, &token_id);
         assert_eq!(a.amount, 500); // NOT 700 — overwrite, not additive
         assert_eq!(a.expiry_ledger, 400);
     }
@@ -250,12 +259,12 @@ mod tests {
         token_admin.mint(&owner, &1_000);
 
         env.ledger().with_mut(|l| l.sequence_number = 100);
-        client.approve(&owner, &spender, &500, &200);
+        client.approve(&owner, &spender, &token_id, &500, &200);
         client.transfer_from(&spender, &token_id, &owner, &to, &300);
 
         assert_eq!(token.balance(&owner), 700);
         assert_eq!(token.balance(&to), 300);
-        let remaining = client.allowance(&owner, &spender);
+        let remaining = client.allowance(&owner, &spender, &token_id);
         assert_eq!(remaining.amount, 200);
     }
 
@@ -270,7 +279,7 @@ mod tests {
         token_admin.mint(&owner, &1_000);
 
         env.ledger().with_mut(|l| l.sequence_number = 100);
-        client.approve(&owner, &spender, &100, &200);
+        client.approve(&owner, &spender, &token_id, &100, &200);
         assert_eq!(
             client.try_transfer_from(&spender, &token_id, &owner, &to, &300),
             Err(Ok(WrapperError::InsufficientAllowance))
@@ -288,7 +297,7 @@ mod tests {
         token_admin.mint(&owner, &1_000);
 
         env.ledger().with_mut(|l| l.sequence_number = 100);
-        client.approve(&owner, &spender, &500, &150);
+        client.approve(&owner, &spender, &token_id, &500, &150);
         env.ledger().with_mut(|l| l.sequence_number = 200);
         assert_eq!(
             client.try_transfer_from(&spender, &token_id, &owner, &to, &100),
@@ -338,7 +347,7 @@ mod tests {
         // ...but is approved for far more (500), so transfer_from's own
         // allowance check passes and it proceeds to persist the debited
         // allowance before calling the underlying token contract.
-        client.approve(&owner, &spender, &500, &200);
+        client.approve(&owner, &spender, &token_id, &500, &200);
 
         // Attempt to move 300 — passes the allowance check (500 >= 300) but
         // exceeds the owner's real underlying balance (100), so the token
@@ -348,7 +357,7 @@ mod tests {
             .is_err());
 
         // The allowance must still read the ORIGINAL, pre-attempt value.
-        let a = client.allowance(&owner, &spender);
+        let a = client.allowance(&owner, &spender, &token_id);
         assert_eq!(a.amount, 500);
         assert_eq!(a.expiry_ledger, 200);
         // And no tokens actually moved.
@@ -366,8 +375,81 @@ mod tests {
         let (token_id, token_admin, _token) = create_token_contract(&env, &admin);
         token_admin.mint(&owner, &1_000);
         env.ledger().with_mut(|l| l.sequence_number = 100);
-        client.approve(&owner, &spender, &500, &200);
+        client.approve(&owner, &spender, &token_id, &500, &200);
         env.ledger().with_mut(|l| l.sequence_number = 200); // exactly at expiry_ledger
         client.transfer_from(&spender, &token_id, &owner, &to, &100); // currently succeeds — lock this in explicitly
     }
+
+    #[test]
+    fn test_approving_second_token_does_not_destroy_first_tokens_allowance() {
+        // Issue #85: approving spender for a second token must not overwrite
+        // or destroy the allowance in place for the first token.
+        let (env, _id, client) = setup();
+        let admin = Address::generate(&env);
+        let owner = Address::generate(&env);
+        let spender = Address::generate(&env);
+        let (token_a, token_a_admin, _) = create_token_contract(&env, &admin);
+        let (token_b, _, _) = create_token_contract(&env, &admin);
+        token_a_admin.mint(&owner, &1_000);
+
+        env.ledger().with_mut(|l| l.sequence_number = 100);
+
+        // Owner grants spender 500 of token_a.
+        client.approve(&owner, &spender, &token_a, &500, &300);
+        assert_eq!(client.allowance(&owner, &spender, &token_a).amount, 500);
+
+        // Owner separately grants the SAME spender an allowance for a
+        // DIFFERENT token, token_b.
+        client.approve(&owner, &spender, &token_b, &300, &300);
+
+        // The token_a allowance is preserved independent of token_b.
+        assert_eq!(client.allowance(&owner, &spender, &token_a).amount, 500);
+        assert_eq!(client.allowance(&owner, &spender, &token_b).amount, 300);
+    }
+
+    #[test]
+    fn test_allowances_for_different_tokens_are_independent() {
+        let (env, _id, client) = setup();
+        let admin = Address::generate(&env);
+        let owner = Address::generate(&env);
+        let spender = Address::generate(&env);
+        let to = Address::generate(&env);
+        let (token_a, token_a_admin, token_a_client) = create_token_contract(&env, &admin);
+        let (token_b, token_b_admin, token_b_client) = create_token_contract(&env, &admin);
+        token_a_admin.mint(&owner, &1_000);
+        token_b_admin.mint(&owner, &1_000);
+
+        env.ledger().with_mut(|l| l.sequence_number = 100);
+
+        // Owner grants spender 500 of token_a.
+        client.approve(&owner, &spender, &token_a, &500, &300);
+        assert_eq!(client.allowance(&owner, &spender, &token_a).amount, 500);
+
+        // Owner separately grants the SAME spender an allowance for a DIFFERENT token, token_b.
+        client.approve(&owner, &spender, &token_b, &300, &400);
+
+        // Assert token_a allowance remains untouched (500, expiry 300)
+        let allowance_a = client.allowance(&owner, &spender, &token_a);
+        assert_eq!(allowance_a.amount, 500);
+        assert_eq!(allowance_a.expiry_ledger, 300);
+
+        // Assert token_b allowance is set properly (300, expiry 400)
+        let allowance_b = client.allowance(&owner, &spender, &token_b);
+        assert_eq!(allowance_b.amount, 300);
+        assert_eq!(allowance_b.expiry_ledger, 400);
+
+        // Spending against token_a debits only token_a allowance
+        client.transfer_from(&spender, &token_a, &owner, &to, &200);
+        assert_eq!(client.allowance(&owner, &spender, &token_a).amount, 300);
+        assert_eq!(client.allowance(&owner, &spender, &token_b).amount, 300);
+        assert_eq!(token_a_client.balance(&to), 200);
+        assert_eq!(token_b_client.balance(&to), 0);
+
+        // Spending against token_b debits only token_b allowance
+        client.transfer_from(&spender, &token_b, &owner, &to, &150);
+        assert_eq!(client.allowance(&owner, &spender, &token_a).amount, 300);
+        assert_eq!(client.allowance(&owner, &spender, &token_b).amount, 150);
+        assert_eq!(token_a_client.balance(&to), 200);
+    }
 }
+

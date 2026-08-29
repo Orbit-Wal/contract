@@ -16,7 +16,7 @@ tokens on behalf of users** who have granted a per-session allowance (per its
 module doc comment). In the intended architecture:
 
 1. The user grants an allowance to the globe-wallet contract via
-   `token-wrapper::approve(owner=user, spender=globe_wallet_id, amount, expiry)`.
+   `token-wrapper::approve(owner=user, spender=globe_wallet_id, token_id, amount, expiry)`.
 2. The globe-wallet contract calls `token-wrapper::transfer_from(spender=globe_wallet_id, ...)`
    internally as part of its payment path.
 3. Globe-wallet enforces daily spend limits via `record_spend` **before** (or as
