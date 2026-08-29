@@ -899,7 +899,8 @@ impl GlobeWallet {
             return Err(WalletError::InvalidAssetCode);
         }
 
-        let is_native = asset.code == String::from_str(&env, "XLM");
+        let is_native =
+            Self::codes_match_case_insensitive(&asset.code, &String::from_str(&env, "XLM"));
         if is_native {
             if asset.issuer.is_some() {
                 return Err(WalletError::InvalidAssetInfo);
@@ -1672,12 +1673,15 @@ mod tests {
         let user = Address::generate(&env);
         for i in 0..GlobeWallet::MAX_ASSETS {
             let code = String::from_str(&env, &std::format!("ASSET{}", i));
-            let asset = AssetInfo { code, issuer: None };
+            let asset = AssetInfo {
+                code,
+                issuer: Some(Address::generate(&env)),
+            };
             client.add_asset(&user, &asset);
         }
         let extra = AssetInfo {
             code: String::from_str(&env, "EXTRA"),
-            issuer: None,
+            issuer: Some(Address::generate(&env)),
         };
         assert_eq!(
             client.try_add_asset(&user, &extra),
@@ -1734,7 +1738,10 @@ mod tests {
         let user = Address::generate(&env);
         for i in 0..3 {
             let code = String::from_str(&env, &std::format!("ASSET{}", i));
-            let asset = AssetInfo { code, issuer: None };
+            let asset = AssetInfo {
+                code,
+                issuer: Some(Address::generate(&env)),
+            };
             client.add_asset(&user, &asset);
         }
         let removed = client.migrate_user_assets(&admin, &user);
@@ -1880,8 +1887,10 @@ mod tests {
         // Use a fabricated hash that was never uploaded via upload_contract_wasm
         let never_uploaded_hash = BytesN::from_array(&env, &[42u8; 32]);
 
-        // propose_upgrade should succeed even with an invalid hash
-        assert_eq!(client.try_propose_upgrade(&admin, &never_uploaded_hash, &0u32), Ok(()));
+        assert_eq!(
+            client.try_propose_upgrade(&admin, &never_uploaded_hash, &0u32),
+            Ok(Ok(()))
+        );
 
         // The proposal is stored
         let cid = id.clone();
@@ -1937,7 +1946,7 @@ mod tests {
 
     #[test]
     fn test_add_and_list_guardians() {
-        let (env, _admin, guardians, client) = setup_with_guardians(3);
+        let (_env, _admin, guardians, client) = setup_with_guardians(3);
         let stored = client.guardians();
         assert_eq!(stored.len(), 3);
         for i in 0..3 {
@@ -2571,6 +2580,81 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_lowercase_and_mixed_case_xlm_with_issuer_rejected_before_native_registered() {
+        let (env, _cid, _admin, client) = setup();
+        let user = Address::generate(&env);
+        let fake_issuer = Address::generate(&env);
+
+        // Lowercase "xlm" with issuer must be rejected outright as InvalidAssetInfo
+        let fake_xlm = AssetInfo {
+            code: String::from_str(&env, "xlm"),
+            issuer: Some(fake_issuer.clone()),
+        };
+        assert_eq!(
+            client.try_add_asset(&user, &fake_xlm),
+            Err(Ok(WalletError::InvalidAssetInfo))
+        );
+
+        // Mixed-case "Xlm" and "xLm" with issuer must also be rejected
+        let fake_xlm_mixed1 = AssetInfo {
+            code: String::from_str(&env, "Xlm"),
+            issuer: Some(fake_issuer.clone()),
+        };
+        assert_eq!(
+            client.try_add_asset(&user, &fake_xlm_mixed1),
+            Err(Ok(WalletError::InvalidAssetInfo))
+        );
+
+        let fake_xlm_mixed2 = AssetInfo {
+            code: String::from_str(&env, "xLm"),
+            issuer: Some(fake_issuer),
+        };
+        assert_eq!(
+            client.try_add_asset(&user, &fake_xlm_mixed2),
+            Err(Ok(WalletError::InvalidAssetInfo))
+        );
+
+        // Registry is clean: no squatting occurred, user has 0 assets
+        assert_eq!(client.get_assets(&user).len(), 0);
+
+        // The user can now register the real, native XLM successfully
+        let real_xlm = AssetInfo {
+            code: String::from_str(&env, "XLM"),
+            issuer: None,
+        };
+        assert_eq!(client.try_add_asset(&user, &real_xlm), Ok(Ok(())));
+        assert_eq!(client.get_assets(&user).len(), 1);
+
+        // Subsequent duplicate attempt with case-variant is rejected as AssetAlreadyAdded
+        let duplicate_xlm = AssetInfo {
+            code: String::from_str(&env, "xlm"),
+            issuer: None,
+        };
+        assert_eq!(
+            client.try_add_asset(&user, &duplicate_xlm),
+            Err(Ok(WalletError::AssetAlreadyAdded))
+        );
+    }
+
+    #[test]
+    fn test_native_xlm_registration_happy_path() {
+        let (env, _cid, _admin, client) = setup();
+        let user = Address::generate(&env);
+
+        // Native XLM registers normally when no squat exists
+        let native_xlm = AssetInfo {
+            code: String::from_str(&env, "XLM"),
+            issuer: None,
+        };
+        assert_eq!(client.try_add_asset(&user, &native_xlm), Ok(Ok(())));
+
+        let assets = client.get_assets(&user);
+        assert_eq!(assets.len(), 1);
+        assert_eq!(assets.get(0).unwrap().code, String::from_str(&env, "XLM"));
+        assert_eq!(assets.get(0).unwrap().issuer, None);
+    }
+
     // ── TTL Extension ───────────────────────────────────────────────────
     //
     // Proactive extend_ttl on every write keeps UserAssets and SpendLimit
@@ -2580,10 +2664,17 @@ mod tests {
 
     #[test]
     fn test_user_assets_ttl_extension_after_long_idle_period() {
-        let (env, _cid, _admin, client) = setup();
+        let (env, cid, _admin, client) = setup();
         let user = Address::generate(&env);
         client.add_asset(&user, &xlm(&env));
         client.add_asset(&user, &usdc(&env));
+
+        // Keep contract instance alive so only the persistent entry TTL is under test
+        env.as_contract(&cid, || {
+            env.storage()
+                .instance()
+                .extend_ttl(PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND_TO);
+        });
 
         // Jump well past the default persistent-entry TTL (4096 ledgers).
         // Without extend_ttl, the entry's default TTL would have expired
@@ -2597,10 +2688,17 @@ mod tests {
 
     #[test]
     fn test_spend_limit_ttl_extension_after_long_idle_period() {
-        let (env, _cid, _admin, client) = setup();
+        let (env, cid, _admin, client) = setup();
         let user = Address::generate(&env);
         let code = String::from_str(&env, "XLM");
         client.set_spend_limit(&user, &code, &1_000_000_i128);
+
+        // Keep contract instance alive so only the persistent entry TTL is under test
+        env.as_contract(&cid, || {
+            env.storage()
+                .instance()
+                .extend_ttl(PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND_TO);
+        });
 
         // Jump well past default persistent-entry TTL.
         env.ledger().with_mut(|l| l.sequence_number += 50_000);
