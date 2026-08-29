@@ -72,6 +72,10 @@ get_assets(env, user) -> Vec<AssetInfo>
 
 // Spend limits
 set_spend_limit(env, user, asset_code, limit: i128) -> Result<()>
+propose_spend_limit_increase(env, user, asset_code, limit: i128, delay_in_ledgers: u32) -> Result<()>
+execute_spend_limit_increase(env, user, asset_code) -> Result<()>
+cancel_spend_limit_increase(env, user, asset_code) -> Result<()>
+get_spend_limit_proposal(env, user, asset_code) -> Option<SpendLimitProposal>
 get_spend_limit(env, user, asset_code) -> i128
 record_spend(env, user, asset_code, amount) -> Result<()>
 ```
@@ -80,6 +84,9 @@ record_spend(env, user, asset_code, amount) -> Result<()>
 
 - Limit is per-user, per-asset, daily (86 400-second window from ledger timestamp).
 - `limit = 0` means unlimited.
+- **Asymmetric Limit Modifications & Compromised-Key Defense:**
+  - Lowering an existing limit or establishing an initial cap is applied **instantly** via `set_spend_limit` (with retroactive enforcement ensuring today's spend doesn't already exceed the new cap).
+  - Raising an existing limit or removing an active cap (`limit = 0`) cannot be done instantly via `set_spend_limit` (rejected with `SpendLimitIncreaseRequiresProposal`). It requires proposing the increase with a minimum timelock delay (`MIN_SPEND_LIMIT_INCREASE_DELAY = 17_280` ledgers / ~24 hours) via `propose_spend_limit_increase`, waiting for the timelock window, and calling `execute_spend_limit_increase`. This defends against the compromised-key threat model by ensuring an attacker with valid user signatures cannot raise the limit and drain funds in a single transaction or session without giving the owner time to cancel (`cancel_spend_limit_increase`).
 - `record_spend` is called from any payment path; rejects with `SpendLimitExceeded` if
   cumulative daily spend would exceed the limit.
 - Day window resets automatically — no manual reset required.
