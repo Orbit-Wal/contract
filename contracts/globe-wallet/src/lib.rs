@@ -32,10 +32,10 @@ pub enum DataKey {
     PendingUpgrade,
     /// Whitelisted assets for a user wallet
     UserAssets(Address),
-    /// Spend limit: (user, asset_code) → limit in stroops
-    SpendLimit(Address, String),
-    /// Daily spent: (user, asset_code) → (amount, day_timestamp)
-    DailySpent(Address, String),
+    /// Spend limit: (user, asset) → limit in stroops
+    SpendLimit(Address, AssetInfo),
+    /// Daily spent: (user, asset) → (amount, day_timestamp)
+    DailySpent(Address, AssetInfo),
     /// Ordered set of guardian addresses authorized to co-sign admin recovery.
     Guardians,
     /// M-of-N approvals required, and the ledger-count timelock delay
@@ -1086,7 +1086,8 @@ impl GlobeWallet {
             return Err(WalletError::AssetLimitExceeded);
         }
         for i in 0..assets.len() {
-            if Self::codes_match_case_insensitive(&assets.get(i).unwrap().code, &asset.code) {
+            let existing = assets.get(i).unwrap();
+            if Self::assets_match(&existing, &asset) {
                 return Err(WalletError::AssetAlreadyAdded);
             }
         }
@@ -1167,57 +1168,65 @@ impl GlobeWallet {
     ///
     /// # Errors
     /// * [`WalletError::InvalidSpendLimit`] — negative limit.
+    /// * [`WalletError::AssetNotFound`] — asset is not registered in caller's `UserAssets`.
     /// * [`WalletError::SpendLimitExceeded`] — current day's spend already
     ///   exceeds the proposed limit.
     pub fn set_spend_limit(
         env: Env,
         user: Address,
-        asset_code: String,
+        asset: AssetInfo,
         limit: i128,
     ) -> Result<(), WalletError> {
         user.require_auth();
         if limit < 0 {
             return Err(WalletError::InvalidSpendLimit);
         }
+
+        let canonical_asset = Self::find_user_asset(&env, &user, &asset)
+            .ok_or(WalletError::AssetNotFound)?;
+
         // Retroactive check: reject if today's spend already exceeds the
         // new limit (unless the new limit is 0 = unlimited).
         if limit != 0 {
             let now = env.ledger().timestamp();
             let day = now / 86400;
-            let key = DataKey::DailySpent(user.clone(), asset_code.clone());
-            let record: SpendRecord = env
-                .storage()
-                .persistent()
-                .get(&key)
-                .unwrap_or(SpendRecord { amount: 0, day });
+            let record = Self::get_daily_spent_record(&env, &user, &canonical_asset, day);
             let spent_today = if record.day == day { record.amount } else { 0 };
             if spent_today > limit {
                 return Err(WalletError::SpendLimitExceeded);
             }
         }
         Self::bump_instance_ttl(&env);
-        env.storage().persistent().set(
-            &DataKey::SpendLimit(user.clone(), asset_code.clone()),
-            &limit,
-        );
+        let key = DataKey::SpendLimit(user.clone(), canonical_asset.clone());
+        env.storage().persistent().set(&key, &limit);
         env.storage().persistent().extend_ttl(
-            &DataKey::SpendLimit(user.clone(), asset_code.clone()),
+            &key,
             PERSISTENT_TTL_THRESHOLD,
             PERSISTENT_TTL_EXTEND_TO,
         );
+
+        let legacy_key = Self::get_legacy_spend_limit_key(&env, &user, &canonical_asset.code);
+        env.storage().persistent().remove(&legacy_key);
+
         env.events().publish(
             (Symbol::new(&env, "spend_limit_set"),),
-            (user, asset_code, limit),
+            (user, canonical_asset.code, limit),
         );
         Ok(())
     }
 
     /// Get the daily spend limit for a user/asset pair (0 = unlimited).
-    pub fn get_spend_limit(env: Env, user: Address, asset_code: String) -> i128 {
-        env.storage()
-            .persistent()
-            .get(&DataKey::SpendLimit(user, asset_code))
-            .unwrap_or(0)
+    pub fn get_spend_limit(env: Env, user: Address, asset: AssetInfo) -> i128 {
+        let canonical_asset = match Self::find_user_asset(&env, &user, &asset) {
+            Some(a) => a,
+            None => return 0,
+        };
+        let key = DataKey::SpendLimit(user.clone(), canonical_asset.clone());
+        if let Some(limit) = env.storage().persistent().get(&key) {
+            return limit;
+        }
+        let legacy_key = Self::get_legacy_spend_limit_key(&env, &user, &canonical_asset.code);
+        env.storage().persistent().get(&legacy_key).unwrap_or(0)
     }
 
     /// Record a spend and reject if it would exceed the daily limit.
@@ -1248,17 +1257,22 @@ impl GlobeWallet {
     ///   the analogous negative-input case; a new variant would also
     ///   collide with the discriminant renumbering tracked in #23, which is
     ///   touching this same enum in parallel.
+    /// * [`WalletError::AssetNotFound`] — asset is not registered in caller's `UserAssets`.
     /// * [`WalletError::SpendLimitExceeded`]
     pub fn record_spend(
         env: Env,
         user: Address,
-        asset_code: String,
+        asset: AssetInfo,
         amount: i128,
     ) -> Result<(), WalletError> {
         user.require_auth();
         if amount <= 0 {
             return Err(WalletError::InvalidSpendLimit);
         }
+
+        let canonical_asset = Self::find_user_asset(&env, &user, &asset)
+            .ok_or(WalletError::AssetNotFound)?;
+
         // A real spend is real wallet activity regardless of whether a
         // limit happens to be configured for this asset — this is one of
         // the most frequently-called functions in normal use, and exactly
@@ -1266,19 +1280,14 @@ impl GlobeWallet {
         // instance storage from silently drifting toward archival (see
         // `bump_instance_ttl`'s doc comment).
         Self::bump_instance_ttl(&env);
-        let limit = Self::get_spend_limit(env.clone(), user.clone(), asset_code.clone());
+        let limit = Self::get_spend_limit(env.clone(), user.clone(), canonical_asset.clone());
         if limit == 0 {
             // No limit configured → always allow
             return Ok(());
         }
         let now = env.ledger().timestamp();
         let day = now / 86400;
-        let key = DataKey::DailySpent(user.clone(), asset_code.clone());
-        let record: SpendRecord = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .unwrap_or(SpendRecord { amount: 0, day });
+        let record = Self::get_daily_spent_record(&env, &user, &canonical_asset, day);
         let spent_today = if record.day == day { record.amount } else { 0 };
         let new_spent = spent_today
             .checked_add(amount)
@@ -1286,6 +1295,7 @@ impl GlobeWallet {
         if new_spent > limit {
             return Err(WalletError::SpendLimitExceeded);
         }
+        let key = DataKey::DailySpent(user.clone(), canonical_asset.clone());
         env.storage()
             .persistent()
             .set(&key, &SpendRecord { amount: new_spent, day });
@@ -1294,9 +1304,13 @@ impl GlobeWallet {
             DAILY_SPENT_TTL_THRESHOLD,
             DAILY_SPENT_TTL_EXTEND_TO,
         );
+
+        let legacy_key = Self::get_legacy_daily_spent_key(&env, &user, &canonical_asset.code);
+        env.storage().persistent().remove(&legacy_key);
+
         env.events().publish(
             (Symbol::new(&env, "spend_recorded"),),
-            (user, asset_code, amount, new_spent, limit),
+            (user, canonical_asset.code, amount, new_spent, limit),
         );
         Ok(())
     }
@@ -1318,89 +1332,113 @@ impl GlobeWallet {
         env.storage()
             .instance()
             .set(&DataKey::TokenWrapperId, &token_wrapper_id);
+        Self::bump_instance_ttl(&env);
         env.events().publish(
             (Symbol::new(&env, "token_wrapper_set"),),
-            token_wrapper_id,
+            (admin, token_wrapper_id),
         );
         Ok(())
     }
 
-    /// Returns the currently configured token-wrapper contract instance, if any.
+    /// Admin: get the configured token-wrapper contract address, if any.
     pub fn get_token_wrapper(env: Env) -> Option<Address> {
         env.storage().instance().get(&DataKey::TokenWrapperId)
     }
 
-    /// Admin: add `token_id` to the set of tokens `send` is permitted to move.
-    ///
-    /// This is a governance/curation decision, not something this contract
-    /// can verify on-chain — the admin is expected to have confirmed
-    /// `token_id` implements the standard token interface correctly and
-    /// represents a real, valued asset before allowlisting it. See
-    /// docs/design/wiring-reentrancy-threat-model.md §4-5.
+    /// Admin: allowlist a token contract address so `send` can move it.
     pub fn add_allowed_token(env: Env, admin: Address, token_id: Address) -> Result<(), WalletError> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
-        let key = DataKey::AllowedToken(token_id.clone());
-        env.storage().persistent().set(&key, &true);
+        env.storage()
+            .persistent()
+            .set(&DataKey::AllowedToken(token_id.clone()), &());
         env.storage().persistent().extend_ttl(
-            &key,
+            &DataKey::AllowedToken(token_id.clone()),
             PERSISTENT_TTL_THRESHOLD,
             PERSISTENT_TTL_EXTEND_TO,
         );
+        Self::bump_instance_ttl(&env);
         env.events().publish(
-            (Symbol::new(&env, "token_allowed"),),
-            token_id,
+            (Symbol::new(&env, "allowed_token_added"),),
+            (admin, token_id),
         );
         Ok(())
     }
 
-    /// Admin: remove `token_id` from the send-allowlist.
+    /// Admin: remove a token contract address from the allowlist.
     pub fn remove_allowed_token(env: Env, admin: Address, token_id: Address) -> Result<(), WalletError> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
         env.storage()
             .persistent()
             .remove(&DataKey::AllowedToken(token_id.clone()));
+        Self::bump_instance_ttl(&env);
         env.events().publish(
-            (Symbol::new(&env, "token_disallowed"),),
-            token_id,
+            (Symbol::new(&env, "allowed_token_removed"),),
+            (admin, token_id),
         );
         Ok(())
     }
 
-    /// Returns whether `token_id` is currently allowlisted for `send`.
+    /// Query whether a token contract address is currently on the allowlist.
     pub fn is_token_allowed(env: Env, token_id: Address) -> bool {
         env.storage()
             .persistent()
-            .get(&DataKey::AllowedToken(token_id))
-            .unwrap_or(false)
+            .has(&DataKey::AllowedToken(token_id))
     }
 
-    /// Atomically enforce the daily spend limit and move `amount` of
-    /// `token_id` from `user` to `to`, via `token-wrapper::transfer_from`.
+    /// High-level payment entry point: enforce daily spend limit, then move
+    /// tokens via the configured token-wrapper contract.
     ///
-    /// `user` must have already granted this contract (i.e.
-    /// `env.current_contract_address()`) an allowance over `token_id` via
-    /// `token-wrapper::approve` before calling this — matching
-    /// `docs/design/architecture.md`'s intended integration flow.
+    /// # Threat-Model Invariants Enforced Here
+    /// 1. **Allowlist gate (§4, mitigation 1):** `token_id` must be on the
+    ///    admin-curated allowlist. Prevents an attacker from passing an
+    ///    adversarial token contract address that ignores allowances or
+    ///    attempts reentrancy.
+    /// 2. **Checks-Effects-Interactions (§3.1):** `record_spend` runs
+    ///    *before* `TokenWrapperClient::transfer_from` is called. Even if
+    ///    the token contract could somehow regain control, the daily limit
+    ///    is already marked spent in persistent storage.
+    /// 3. **Exact-amount authorization (§4, mitigation 2):** `send` moves
+    ///    `amount` (the exact amount authorized by `user` for this call),
+    ///    consuming allowance from `user` to `GlobeWallet` via the wrapper.
+    /// 4. **Atomicity across contracts (§3.1):** if `transfer_from` fails
+    ///    (bad allowance, insufficient balance, etc.), the whole Soroban
+    ///    invocation reverts, rolling back the `record_spend` write so the
+    ///    user's daily limit is not consumed for a payment that didn't
+    ///    move tokens.
     ///
     /// # Errors
-    /// * [`WalletError::TokenNotAllowed`] if `token_id` is not allowlisted.
-    /// * [`WalletError::TokenWrapperNotSet`] if no admin has configured the
-    ///   token-wrapper instance yet.
-    /// * [`WalletError::SpendLimitExceeded`] / [`WalletError::SpendOverflow`]
-    ///   per `record_spend`'s existing rules.
+    /// * [`WalletError::TokenNotAllowed`] — `token_id` not on the allowlist.
+    /// * [`WalletError::TokenWrapperNotSet`] — admin has not called `set_token_wrapper`.
+    /// * [`WalletError::InvalidSpendLimit`] — `amount` is not strictly positive.
+    /// * [`WalletError::AssetNotFound`] — `asset` is not registered in user's asset list.
+    /// * [`WalletError::SpendLimitExceeded`] — payment would exceed daily limit.
+    /// * [`WalletError::SpendOverflow`] — daily accumulator would overflow i128.
+    /// * [`WalletError::TokenTransferFailed`] — token-wrapper's `transfer_from` failed.
     ///
-    /// A failure at any step reverts the whole call, including any
-    /// `record_spend` write already applied in this same invocation —
-    /// Soroban transactions are all-or-nothing, so there is no path where
-    /// the daily counter advances without the underlying transfer actually
-    /// succeeding (or vice versa).
+    /// # Reentrancy
+    /// `send` is the top-level orchestrator. The external call is
+    /// `TokenWrapperClient::transfer_from`, which makes a further external
+    /// call to the token contract. Per `docs/design/wiring-reentrancy-threat-model.md`,
+    /// this 3-hop chain is safe because:
+    /// - `record_spend` is invoked as a direct associated-function call on
+    ///   the same host frame before any external invocation is started.
+    /// - GlobeWallet is active on the host call stack throughout `send`'s
+    ///   execution, so Soroban's native cross-contract reentrancy guard
+    ///   strictly forbids `token-wrapper` or `token_id` from calling back
+    ///   into any `GlobeWallet` function.
+    /// - Any callback attempted from the token contract fails at the host
+    ///   level, bubbling up as a transaction failure and causing the
+    ///   `record_spend` write already applied in this same invocation —
+    ///   Soroban transactions are all-or-nothing, so there is no path where
+    ///   the daily counter advances without the underlying transfer actually
+    ///   succeeding (or vice versa).
     pub fn send(
         env: Env,
         user: Address,
         token_id: Address,
-        asset_code: String,
+        asset: AssetInfo,
         to: Address,
         amount: i128,
     ) -> Result<(), WalletError> {
@@ -1425,7 +1463,7 @@ impl GlobeWallet {
         //    a plain associated-function call (same host frame), so
         //    record_spend's existing reentrancy proof
         //    (docs/record-spend-reentrancy.md) is untouched by this wiring.
-        Self::record_spend(env.clone(), user.clone(), asset_code, amount)?;
+        Self::record_spend(env.clone(), user.clone(), asset, amount)?;
 
         let wrapper_id: Address = env
             .storage()
@@ -1461,6 +1499,62 @@ impl GlobeWallet {
 
     // ── Migration ───────────────────────────────────────────────────────────────
 
+    /// Migrate legacy spend limits and daily spend records keyed by `(Address, String)`
+    /// to `(Address, AssetInfo)` keys for all assets currently registered by the user.
+    pub fn migrate_spend_limits(env: Env, user: Address) -> Result<u32, WalletError> {
+        user.require_auth();
+        let assets: Vec<AssetInfo> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::UserAssets(user.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut count = 0u32;
+        let now = env.ledger().timestamp();
+        let day = now / 86400;
+
+        for i in 0..assets.len() {
+            let asset = assets.get(i).unwrap();
+            let legacy_spend_key = Self::get_legacy_spend_limit_key(&env, &user, &asset.code);
+            let legacy_limit: Option<i128> = env.storage().persistent().get(&legacy_spend_key);
+
+            let new_spend_key = DataKey::SpendLimit(user.clone(), asset.clone());
+            if let Some(limit) = legacy_limit {
+                if !env.storage().persistent().has(&new_spend_key) {
+                    env.storage().persistent().set(&new_spend_key, &limit);
+                    env.storage().persistent().extend_ttl(
+                        &new_spend_key,
+                        PERSISTENT_TTL_THRESHOLD,
+                        PERSISTENT_TTL_EXTEND_TO,
+                    );
+                }
+                env.storage().persistent().remove(&legacy_spend_key);
+                count += 1;
+            }
+
+            let legacy_daily_key = Self::get_legacy_daily_spent_key(&env, &user, &asset.code);
+            let legacy_daily: Option<SpendRecord> = env.storage().persistent().get(&legacy_daily_key);
+            let new_daily_key = DataKey::DailySpent(user.clone(), asset.clone());
+            if let Some(record) = legacy_daily {
+                if !env.storage().persistent().has(&new_daily_key) && record.day == day {
+                    env.storage().persistent().set(&new_daily_key, &record);
+                    env.storage().persistent().extend_ttl(
+                        &new_daily_key,
+                        DAILY_SPENT_TTL_THRESHOLD,
+                        DAILY_SPENT_TTL_EXTEND_TO,
+                    );
+                }
+                env.storage().persistent().remove(&legacy_daily_key);
+            }
+        }
+
+        Self::bump_instance_ttl(&env);
+        env.events().publish(
+            (Symbol::new(&env, "spend_limits_migrated"),),
+            (user, count),
+        );
+        Ok(count)
+    }
+
     /// Admin and user: trim a user's asset list to [`GlobeWallet::MAX_ASSETS`] if it exceeds the bound.
     /// Returns the number of assets trimmed (0 if already within limit).
     ///
@@ -1489,8 +1583,12 @@ impl GlobeWallet {
         }
         for i in Self::MAX_ASSETS..len {
             let dropped = assets.get(i).unwrap();
-            env.storage().persistent().remove(&DataKey::SpendLimit(user.clone(), dropped.code.clone()));
-            env.storage().persistent().remove(&DataKey::DailySpent(user.clone(), dropped.code.clone()));
+            env.storage().persistent().remove(&DataKey::SpendLimit(user.clone(), dropped.clone()));
+            env.storage().persistent().remove(&DataKey::DailySpent(user.clone(), dropped.clone()));
+            let legacy_spend_key = Self::get_legacy_spend_limit_key(&env, &user, &dropped.code);
+            let legacy_daily_key = Self::get_legacy_daily_spent_key(&env, &user, &dropped.code);
+            env.storage().persistent().remove(&legacy_spend_key);
+            env.storage().persistent().remove(&legacy_daily_key);
         }
         env.storage()
             .persistent()
@@ -1547,6 +1645,49 @@ impl GlobeWallet {
             }
         }
         buf_a[..len] == buf_b[..len]
+    }
+
+    /// Compare two `AssetInfo`s for equality:
+    /// - Codes match case-insensitively (`codes_match_case_insensitive`)
+    /// - Issuers are identical (`a.issuer == b.issuer`)
+    fn assets_match(a: &AssetInfo, b: &AssetInfo) -> bool {
+        if !Self::codes_match_case_insensitive(&a.code, &b.code) {
+            return false;
+        }
+        a.issuer == b.issuer
+    }
+
+    /// Look up registered asset in `UserAssets(user)` matching the given `AssetInfo`.
+    /// Returns the canonical `AssetInfo` stored in `UserAssets(user)` if found, or `None`.
+    fn find_user_asset(env: &Env, user: &Address, asset: &AssetInfo) -> Option<AssetInfo> {
+        let assets: Vec<AssetInfo> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::UserAssets(user.clone()))?;
+        for i in 0..assets.len() {
+            let a = assets.get(i).unwrap();
+            if Self::assets_match(&a, asset) {
+                return Some(a);
+            }
+        }
+        None
+    }
+
+    fn get_legacy_spend_limit_key(env: &Env, user: &Address, code: &String) -> (Symbol, Address, String) {
+        (Symbol::new(env, "SpendLimit"), user.clone(), code.clone())
+    }
+
+    fn get_legacy_daily_spent_key(env: &Env, user: &Address, code: &String) -> (Symbol, Address, String) {
+        (Symbol::new(env, "DailySpent"), user.clone(), code.clone())
+    }
+
+    fn get_daily_spent_record(env: &Env, user: &Address, canonical_asset: &AssetInfo, day: u64) -> SpendRecord {
+        let key = DataKey::DailySpent(user.clone(), canonical_asset.clone());
+        if let Some(record) = env.storage().persistent().get(&key) {
+            return record;
+        }
+        let legacy_key = Self::get_legacy_daily_spent_key(env, user, &canonical_asset.code);
+        env.storage().persistent().get(&legacy_key).unwrap_or(SpendRecord { amount: 0, day })
     }
 
     /// Bump this contract's own *instance* storage TTL (`Admin`, `Guardians`,
@@ -1747,13 +1888,14 @@ mod tests {
 
     #[test]
     fn test_add_asset_case_variant_duplicate_fails() {
-        // issue #29: "USDC" and "usdc" must be treated as the same asset.
+        // issue #29: "USDC" and "usdc" with the same issuer must be treated as duplicate.
         let (env, _cid, _admin, client) = setup();
         let user = Address::generate(&env);
-        client.add_asset(&user, &usdc(&env)); // "USDC"
+        let usdc_asset = usdc(&env);
+        client.add_asset(&user, &usdc_asset); // "USDC"
         let lower = AssetInfo {
             code: String::from_str(&env, "usdc"),
-            issuer: Some(Address::generate(&env)),
+            issuer: usdc_asset.issuer.clone(),
         };
         assert_eq!(
             client.try_add_asset(&user, &lower),
@@ -1789,30 +1931,33 @@ mod tests {
     fn test_spend_limit_set_and_get() {
         let (env, _cid, _admin, client) = setup();
         let user = Address::generate(&env);
-        let code = String::from_str(&env, "XLM");
-        client.set_spend_limit(&user, &code, &1_000_000_i128);
-        assert_eq!(client.get_spend_limit(&user, &code), 1_000_000);
+        let asset = xlm(&env);
+        client.add_asset(&user, &asset);
+        client.set_spend_limit(&user, &asset, &1_000_000_i128);
+        assert_eq!(client.get_spend_limit(&user, &asset), 1_000_000);
     }
 
     #[test]
     fn test_record_spend_within_limit() {
         let (env, _cid, _admin, client) = setup();
         let user = Address::generate(&env);
-        let code = String::from_str(&env, "XLM");
-        client.set_spend_limit(&user, &code, &1_000_000_i128);
-        client.record_spend(&user, &code, &500_000_i128);
-        client.record_spend(&user, &code, &499_999_i128);
+        let asset = xlm(&env);
+        client.add_asset(&user, &asset);
+        client.set_spend_limit(&user, &asset, &1_000_000_i128);
+        client.record_spend(&user, &asset, &500_000_i128);
+        client.record_spend(&user, &asset, &499_999_i128);
     }
 
     #[test]
     fn test_record_spend_exceeds_limit_fails() {
         let (env, _cid, _admin, client) = setup();
         let user = Address::generate(&env);
-        let code = String::from_str(&env, "XLM");
-        client.set_spend_limit(&user, &code, &1_000_000_i128);
-        client.record_spend(&user, &code, &999_999_i128);
+        let asset = xlm(&env);
+        client.add_asset(&user, &asset);
+        client.set_spend_limit(&user, &asset, &1_000_000_i128);
+        client.record_spend(&user, &asset, &999_999_i128);
         assert_eq!(
-            client.try_record_spend(&user, &code, &2_i128),
+            client.try_record_spend(&user, &asset, &2_i128),
             Err(Ok(WalletError::SpendLimitExceeded))
         );
     }
@@ -1821,10 +1966,11 @@ mod tests {
     fn test_record_spend_negative_amount_fails() {
         let (env, _cid, _admin, client) = setup();
         let user = Address::generate(&env);
-        let code = String::from_str(&env, "XLM");
-        client.set_spend_limit(&user, &code, &1_000_000_i128);
+        let asset = xlm(&env);
+        client.add_asset(&user, &asset);
+        client.set_spend_limit(&user, &asset, &1_000_000_i128);
         assert_eq!(
-            client.try_record_spend(&user, &code, &(-1_i128)),
+            client.try_record_spend(&user, &asset, &(-1_i128)),
             Err(Ok(WalletError::InvalidSpendLimit))
         );
     }
@@ -1833,10 +1979,11 @@ mod tests {
     fn test_record_spend_zero_amount_fails() {
         let (env, _cid, _admin, client) = setup();
         let user = Address::generate(&env);
-        let code = String::from_str(&env, "XLM");
-        client.set_spend_limit(&user, &code, &1_000_000_i128);
+        let asset = xlm(&env);
+        client.add_asset(&user, &asset);
+        client.set_spend_limit(&user, &asset, &1_000_000_i128);
         assert_eq!(
-            client.try_record_spend(&user, &code, &0_i128),
+            client.try_record_spend(&user, &asset, &0_i128),
             Err(Ok(WalletError::InvalidSpendLimit))
         );
     }
@@ -1848,12 +1995,13 @@ mod tests {
         // before the limit comparison.
         let (env, _cid, _admin, client) = setup();
         let user = Address::generate(&env);
-        let code = String::from_str(&env, "XLM");
-        client.set_spend_limit(&user, &code, &1_000_000_i128);
-        client.record_spend(&user, &code, &900_000_i128);
+        let asset = xlm(&env);
+        client.add_asset(&user, &asset);
+        client.set_spend_limit(&user, &asset, &1_000_000_i128);
+        client.record_spend(&user, &asset, &900_000_i128);
 
         assert_eq!(
-            client.try_record_spend(&user, &code, &(-900_000_i128)),
+            client.try_record_spend(&user, &asset, &(-900_000_i128)),
             Err(Ok(WalletError::InvalidSpendLimit))
         );
 
@@ -1861,13 +2009,13 @@ mod tests {
         // of headroom against the 1_000_000 limit. One unit over that
         // headroom must be rejected...
         assert_eq!(
-            client.try_record_spend(&user, &code, &100_001_i128),
+            client.try_record_spend(&user, &asset, &100_001_i128),
             Err(Ok(WalletError::SpendLimitExceeded))
         );
         // ...while spending exactly the remaining headroom must succeed,
         // proving spent_today was neither reset nor left in some other
         // corrupted value by the rejected negative-amount call.
-        client.record_spend(&user, &code, &100_000_i128);
+        client.record_spend(&user, &asset, &100_000_i128);
     }
 
     #[test]
@@ -1877,13 +2025,14 @@ mod tests {
         // the configured limit was supposed to allow for the day.
         let (env, _cid, _admin, client) = setup();
         let user = Address::generate(&env);
-        let code = String::from_str(&env, "XLM");
-        client.set_spend_limit(&user, &code, &1_000_000_i128);
-        client.record_spend(&user, &code, &900_000_i128);
+        let asset = xlm(&env);
+        client.add_asset(&user, &asset);
+        client.set_spend_limit(&user, &asset, &1_000_000_i128);
+        client.record_spend(&user, &asset, &900_000_i128);
 
         // Attempted reset via negative amount must be rejected outright...
         assert_eq!(
-            client.try_record_spend(&user, &code, &(-900_000_i128)),
+            client.try_record_spend(&user, &asset, &(-900_000_i128)),
             Err(Ok(WalletError::InvalidSpendLimit))
         );
 
@@ -1892,7 +2041,7 @@ mod tests {
         // further 999_999 remains correctly rejected as exceeding the
         // 1_000_000 daily limit.
         assert_eq!(
-            client.try_record_spend(&user, &code, &999_999_i128),
+            client.try_record_spend(&user, &asset, &999_999_i128),
             Err(Ok(WalletError::SpendLimitExceeded))
         );
     }
@@ -1901,26 +2050,28 @@ mod tests {
     fn test_record_spend_overflow_does_not_poison_later_calls() {
         let (env, _cid, _admin, client) = setup();
         let user = Address::generate(&env);
-        let code = String::from_str(&env, "XLM");
-        client.set_spend_limit(&user, &code, &i128::MAX);
+        let asset = xlm(&env);
+        client.add_asset(&user, &asset);
+        client.set_spend_limit(&user, &asset, &i128::MAX);
 
-        client.record_spend(&user, &code, &1_i128);
+        client.record_spend(&user, &asset, &1_i128);
 
         assert_eq!(
-            client.try_record_spend(&user, &code, &i128::MAX),
+            client.try_record_spend(&user, &asset, &i128::MAX),
             Err(Ok(WalletError::SpendOverflow))
         );
 
-        client.record_spend(&user, &code, &1_i128);
+        client.record_spend(&user, &asset, &1_i128);
     }
 
     #[test]
     fn test_no_limit_allows_any_spend() {
         let (env, _cid, _admin, client) = setup();
         let user = Address::generate(&env);
-        let code = String::from_str(&env, "XLM");
+        let asset = xlm(&env);
+        client.add_asset(&user, &asset);
         // No set_spend_limit call → unlimited
-        client.record_spend(&user, &code, &i128::MAX);
+        client.record_spend(&user, &asset, &i128::MAX);
     }
 
     /// Retroactive enforcement: raise limit → spend near it → lower limit
@@ -1929,36 +2080,37 @@ mod tests {
     fn test_raise_spend_then_lower_limit() {
         let (env, _cid, _admin, client) = setup();
         let user = Address::generate(&env);
-        let code = String::from_str(&env, "XLM");
+        let asset = xlm(&env);
+        client.add_asset(&user, &asset);
 
         // 1. Set a high limit
-        client.set_spend_limit(&user, &code, &1_000_000_i128);
+        client.set_spend_limit(&user, &asset, &1_000_000_i128);
 
         // 2. Spend close to the high limit
-        client.record_spend(&user, &code, &900_000_i128);
+        client.record_spend(&user, &asset, &900_000_i128);
 
         // 3. Try to lower the limit below what was already spent → must fail
         assert_eq!(
-            client.try_set_spend_limit(&user, &code, &500_000_i128),
+            client.try_set_spend_limit(&user, &asset, &500_000_i128),
             Err(Ok(WalletError::SpendLimitExceeded))
         );
 
         // 4. The old limit should still be in effect
-        assert_eq!(client.get_spend_limit(&user, &code), 1_000_000);
+        assert_eq!(client.get_spend_limit(&user, &asset), 1_000_000);
 
         // 5. Lowering to exactly the spent amount should succeed
-        client.set_spend_limit(&user, &code, &900_000_i128);
-        assert_eq!(client.get_spend_limit(&user, &code), 900_000);
+        client.set_spend_limit(&user, &asset, &900_000_i128);
+        assert_eq!(client.get_spend_limit(&user, &asset), 900_000);
 
         // 6. Further spending is now blocked (at the exact limit)
         assert_eq!(
-            client.try_record_spend(&user, &code, &1_i128),
+            client.try_record_spend(&user, &asset, &1_i128),
             Err(Ok(WalletError::SpendLimitExceeded))
         );
 
         // 7. Removing the limit (setting to 0 = unlimited) should always work
-        client.set_spend_limit(&user, &code, &0_i128);
-        assert_eq!(client.get_spend_limit(&user, &code), 0);
+        client.set_spend_limit(&user, &asset, &0_i128);
+        assert_eq!(client.get_spend_limit(&user, &asset), 0);
     }
 
     #[test]
@@ -1979,9 +2131,10 @@ mod tests {
         // spend counter before the real 86_400s day window elapses.
         let (env, _cid, _admin, client) = setup();
         let user = Address::generate(&env);
-        let code = String::from_str(&env, "XLM");
-        client.set_spend_limit(&user, &code, &1_000_000_i128);
-        client.record_spend(&user, &code, &900_000_i128);
+        let asset = xlm(&env);
+        client.add_asset(&user, &asset);
+        client.set_spend_limit(&user, &asset, &1_000_000_i128);
+        client.record_spend(&user, &asset, &900_000_i128);
 
         // Simulate an eviction sweep of *temporary* storage only (persistent
         // entries are untouched) by bumping the ledger sequence far past the
@@ -1994,7 +2147,7 @@ mod tests {
         // If DailySpent were still in temporary storage this would have been
         // archived/reset to 0 and the next 200_000 spend would wrongly succeed.
         assert_eq!(
-            client.try_record_spend(&user, &code, &200_000_i128),
+            client.try_record_spend(&user, &asset, &200_000_i128),
             Err(Ok(WalletError::SpendLimitExceeded))
         );
     }
@@ -2080,7 +2233,7 @@ mod tests {
         let mut assets: Vec<AssetInfo> = Vec::new(&env);
         for i in 0..GlobeWallet::MAX_ASSETS + 10 {
             let code = String::from_str(&env, &std::format!("ASSET{}", i));
-            assets.push_back(AssetInfo { code: code.clone(), issuer: None });
+            assets.push_back(AssetInfo { code: code.clone(), issuer: Some(Address::generate(&env)) });
         }
         env.as_contract(&cid, || {
             env.storage()
@@ -2089,29 +2242,29 @@ mod tests {
                 
             // Set up some spend limits and daily spent records for all assets
             for i in 0..GlobeWallet::MAX_ASSETS + 10 {
-                let code = String::from_str(&env, &std::format!("ASSET{}", i));
-                env.storage().persistent().set(&DataKey::SpendLimit(user.clone(), code.clone()), &1000_i128);
-                env.storage().persistent().set(&DataKey::DailySpent(user.clone(), code.clone()), &SpendRecord { amount: 500, day: 0 });
+                let asset = assets.get(i).unwrap();
+                env.storage().persistent().set(&DataKey::SpendLimit(user.clone(), asset.clone()), &1000_i128);
+                env.storage().persistent().set(&DataKey::DailySpent(user.clone(), asset.clone()), &SpendRecord { amount: 500, day: 0 });
             }
         });
         let removed = client.migrate_user_assets(&admin, &user);
         assert_eq!(removed, 10);
-        let assets = client.get_assets(&user);
-        assert_eq!(assets.len(), GlobeWallet::MAX_ASSETS as u32);
+        let user_assets = client.get_assets(&user);
+        assert_eq!(user_assets.len(), GlobeWallet::MAX_ASSETS as u32);
         
         env.as_contract(&cid, || {
             // Verify that dropped assets' storage keys are removed
             for i in GlobeWallet::MAX_ASSETS..GlobeWallet::MAX_ASSETS + 10 {
-                let code = String::from_str(&env, &std::format!("ASSET{}", i));
-                assert!(!env.storage().persistent().has(&DataKey::SpendLimit(user.clone(), code.clone())));
-                assert!(!env.storage().persistent().has(&DataKey::DailySpent(user.clone(), code.clone())));
+                let asset = assets.get(i).unwrap();
+                assert!(!env.storage().persistent().has(&DataKey::SpendLimit(user.clone(), asset.clone())));
+                assert!(!env.storage().persistent().has(&DataKey::DailySpent(user.clone(), asset.clone())));
             }
             
             // Verify that kept assets' storage keys are intact
             for i in 0..GlobeWallet::MAX_ASSETS {
-                let code = String::from_str(&env, &std::format!("ASSET{}", i));
-                assert!(env.storage().persistent().has(&DataKey::SpendLimit(user.clone(), code.clone())));
-                assert!(env.storage().persistent().has(&DataKey::DailySpent(user.clone(), code.clone())));
+                let asset = assets.get(i).unwrap();
+                assert!(env.storage().persistent().has(&DataKey::SpendLimit(user.clone(), asset.clone())));
+                assert!(env.storage().persistent().has(&DataKey::DailySpent(user.clone(), asset.clone())));
             }
         });
     }
@@ -3072,19 +3225,20 @@ mod tests {
     fn test_record_spend_boundary_last_second_of_day_accumulates() {
         let (env, _cid, _admin, client) = setup();
         let user = Address::generate(&env);
-        let code = String::from_str(&env, "XLM");
-        client.set_spend_limit(&user, &code, &1_000_i128);
+        let asset = xlm(&env);
+        client.add_asset(&user, &asset);
+        client.set_spend_limit(&user, &asset, &1_000_i128);
 
         // Set timestamp to the very last second of day 1 (day 0 bucket ends at 86399)
         let day = 1u64;
         let last_sec_of_day = day * 86_400 - 1; // 86_399 → still in bucket 0
         env.ledger().with_mut(|l| l.timestamp = last_sec_of_day);
 
-        client.record_spend(&user, &code, &600_i128);
+        client.record_spend(&user, &asset, &600_i128);
 
         // Second call in the same bucket should accumulate
         assert_eq!(
-            client.try_record_spend(&user, &code, &401_i128),
+            client.try_record_spend(&user, &asset, &401_i128),
             Err(Ok(WalletError::SpendLimitExceeded)),
             "Two spends in the same bucket must accumulate: 600+401 > 1000"
         );
@@ -3095,18 +3249,19 @@ mod tests {
     fn test_record_spend_boundary_first_second_of_new_day_resets() {
         let (env, _cid, _admin, client) = setup();
         let user = Address::generate(&env);
-        let code = String::from_str(&env, "XLM");
-        client.set_spend_limit(&user, &code, &1_000_i128);
+        let asset = xlm(&env);
+        client.add_asset(&user, &asset);
+        client.set_spend_limit(&user, &asset, &1_000_i128);
 
         // Spend 900 in bucket 0
         env.ledger().with_mut(|l| l.timestamp = 86_399); // bucket 0 = ts/86400 == 0
-        client.record_spend(&user, &code, &900_i128);
+        client.record_spend(&user, &asset, &900_i128);
 
         // Advance to the exact start of bucket 1 — counter must reset
         env.ledger().with_mut(|l| l.timestamp = 86_400); // bucket 1 = ts/86400 == 1
 
         // Should succeed because we're in a brand-new bucket
-        client.record_spend(&user, &code, &1_000_i128);
+        client.record_spend(&user, &asset, &1_000_i128);
     }
 
     /// Explicit boundary: timestamp N*86400 - 1 vs N*86400 are different buckets.
@@ -3114,8 +3269,9 @@ mod tests {
     fn test_record_spend_exact_day_boundary() {
         let (env, _cid, _admin, client) = setup();
         let user = Address::generate(&env);
-        let code = String::from_str(&env, "XLM");
-        client.set_spend_limit(&user, &code, &500_i128);
+        let asset = xlm(&env);
+        client.add_asset(&user, &asset);
+        client.set_spend_limit(&user, &asset, &500_i128);
 
         let n: u64 = 5;
         let before_boundary = n * 86_400 - 1; // bucket n-1
@@ -3123,17 +3279,17 @@ mod tests {
 
         // Spend right at the boundary-minus-one
         env.ledger().with_mut(|l| l.timestamp = before_boundary);
-        client.record_spend(&user, &code, &500_i128); // fills bucket n-1 exactly
+        client.record_spend(&user, &asset, &500_i128); // fills bucket n-1 exactly
 
         // Any more spend in bucket n-1 must fail
         assert_eq!(
-            client.try_record_spend(&user, &code, &1_i128),
+            client.try_record_spend(&user, &asset, &1_i128),
             Err(Ok(WalletError::SpendLimitExceeded))
         );
 
         // Crossing into bucket n resets the counter: full 500 must be available again
         env.ledger().with_mut(|l| l.timestamp = at_boundary);
-        client.record_spend(&user, &code, &500_i128);
+        client.record_spend(&user, &asset, &500_i128);
     }
 
     /// Validates that the bucket is derived from integer division (not rounding).
@@ -3141,8 +3297,9 @@ mod tests {
     fn test_record_spend_bucket_is_integer_division() {
         let (env, _cid, _admin, client) = setup();
         let user = Address::generate(&env);
-        let code = String::from_str(&env, "XLM");
-        client.set_spend_limit(&user, &code, &100_i128);
+        let asset = xlm(&env);
+        client.add_asset(&user, &asset);
+        client.set_spend_limit(&user, &asset, &100_i128);
 
         // All three timestamps below belong to bucket 1 (86400..=172799)
         // Reset env per iteration by re-registering is expensive;
@@ -3151,12 +3308,12 @@ mod tests {
 
         // Spend 50 in bucket 1
         env.ledger().with_mut(|l| l.timestamp = 86_400);
-        client.record_spend(&user, &code, &50_i128);
+        client.record_spend(&user, &asset, &50_i128);
 
         // Move to middle of same bucket — still bucket 1, should accumulate
         env.ledger().with_mut(|l| l.timestamp = 129_600); // 86400 + 43200
         assert_eq!(
-            client.try_record_spend(&user, &code, &51_i128),
+            client.try_record_spend(&user, &asset, &51_i128),
             Err(Ok(WalletError::SpendLimitExceeded)),
             "50+51 > 100: mid-bucket accumulation must hold"
         );
@@ -3164,7 +3321,7 @@ mod tests {
         // Move to end of bucket 1
         env.ledger().with_mut(|l| l.timestamp = 172_799);
         assert_eq!(
-            client.try_record_spend(&user, &code, &51_i128),
+            client.try_record_spend(&user, &asset, &51_i128),
             Err(Ok(WalletError::SpendLimitExceeded)),
             "50+51 > 100: end-of-bucket accumulation must hold"
         );
@@ -3179,8 +3336,9 @@ mod tests {
     fn test_record_spend_boundary_drift_awareness() {
         let (env, _cid, _admin, client) = setup();
         let user = Address::generate(&env);
-        let code = String::from_str(&env, "XLM");
-        client.set_spend_limit(&user, &code, &1_000_i128);
+        let asset = xlm(&env);
+        client.add_asset(&user, &asset);
+        client.set_spend_limit(&user, &asset, &1_000_i128);
 
         // Two validator-derived timestamps 2 seconds apart straddling midnight
         let just_before = 2 * 86_400 - 1;
@@ -3188,14 +3346,14 @@ mod tests {
 
         // Spend near-limit just before midnight
         env.ledger().with_mut(|l| l.timestamp = just_before);
-        client.record_spend(&user, &code, &999_i128);
+        client.record_spend(&user, &asset, &999_i128);
 
         // If a second tx arrives 1 second later it lands in a new bucket and is ALLOWED.
         // This is the known fixed-bucket split: user perceives same-session but
         // contract resets. Not exploitable (it's more restrictive by resetting), but
         // confusing to users.
         env.ledger().with_mut(|l| l.timestamp = just_after);
-        client.record_spend(&user, &code, &1_000_i128); // succeeds — new bucket
+        client.record_spend(&user, &asset, &1_000_i128); // succeeds — new bucket
     }
 
     #[test]
@@ -3254,13 +3412,14 @@ mod tests {
     fn test_spend_limit_ttl_extension_after_long_idle_period() {
         let (env, _cid, _admin, client) = setup();
         let user = Address::generate(&env);
-        let code = String::from_str(&env, "XLM");
-        client.set_spend_limit(&user, &code, &1_000_000_i128);
+        let asset = xlm(&env);
+        client.add_asset(&user, &asset);
+        client.set_spend_limit(&user, &asset, &1_000_000_i128);
 
         // Jump well past default persistent-entry TTL.
         env.ledger().with_mut(|l| l.sequence_number += 50_000);
 
-        assert_eq!(client.get_spend_limit(&user, &code), 1_000_000);
+        assert_eq!(client.get_spend_limit(&user, &asset), 1_000_000);
     }
 
     // ── Wiring: globe-wallet <-> token-wrapper ───────────────────────────────
@@ -3292,17 +3451,18 @@ mod tests {
         let token_admin = Address::generate(&env);
         let user = Address::generate(&env);
         let to = Address::generate(&env);
-        let code = String::from_str(&env, "XLM");
+        let asset = xlm(&env);
+        client.add_asset(&user, &asset);
         let (token_id, token_admin_client, token) = create_real_token(&env, &token_admin);
         token_admin_client.mint(&user, &1_000);
 
         client.add_allowed_token(&admin, &token_id);
-        client.set_spend_limit(&user, &code, &500_i128);
+        client.set_spend_limit(&user, &asset, &500_i128);
 
         env.ledger().with_mut(|l| l.sequence_number = 100);
         wrapper_client.approve(&user, &wallet_id, &500, &10_000);
 
-        client.send(&user, &token_id, &code, &to, &200);
+        client.send(&user, &token_id, &asset, &to, &200);
 
         assert_eq!(token.balance(&user), 800);
         assert_eq!(token.balance(&to), 200);
@@ -3314,13 +3474,14 @@ mod tests {
         let (env, _wallet_id, _admin, client, _wrapper_client) = setup_wiring();
         let user = Address::generate(&env);
         let to = Address::generate(&env);
-        let code = String::from_str(&env, "XLM");
+        let asset = xlm(&env);
+        client.add_asset(&user, &asset);
         let token_admin = Address::generate(&env);
         let (token_id, _token_admin_client, _token) = create_real_token(&env, &token_admin);
         // Deliberately NOT allowlisted.
 
         assert_eq!(
-            client.try_send(&user, &token_id, &code, &to, &100),
+            client.try_send(&user, &token_id, &asset, &to, &100),
             Err(Ok(WalletError::TokenNotAllowed))
         );
     }
@@ -3330,14 +3491,15 @@ mod tests {
         let (env, _cid, admin, client) = setup();
         let user = Address::generate(&env);
         let to = Address::generate(&env);
-        let code = String::from_str(&env, "XLM");
+        let asset = xlm(&env);
+        client.add_asset(&user, &asset);
         let token_admin = Address::generate(&env);
         let (token_id, _token_admin_client, _token) = create_real_token(&env, &token_admin);
         client.add_allowed_token(&admin, &token_id);
         // Deliberately never called set_token_wrapper.
 
         assert_eq!(
-            client.try_send(&user, &token_id, &code, &to, &100),
+            client.try_send(&user, &token_id, &asset, &to, &100),
             Err(Ok(WalletError::TokenWrapperNotSet))
         );
     }
@@ -3351,18 +3513,19 @@ mod tests {
         let token_admin = Address::generate(&env);
         let user = Address::generate(&env);
         let to = Address::generate(&env);
-        let code = String::from_str(&env, "XLM");
+        let asset = xlm(&env);
+        client.add_asset(&user, &asset);
         let (token_id, token_admin_client, token) = create_real_token(&env, &token_admin);
         token_admin_client.mint(&user, &1_000);
 
         client.add_allowed_token(&admin, &token_id);
-        client.set_spend_limit(&user, &code, &100_i128);
+        client.set_spend_limit(&user, &asset, &100_i128);
 
         env.ledger().with_mut(|l| l.sequence_number = 100);
         wrapper_client.approve(&user, &wallet_id, &500, &10_000);
 
         assert_eq!(
-            client.try_send(&user, &token_id, &code, &to, &200),
+            client.try_send(&user, &token_id, &asset, &to, &200),
             Err(Ok(WalletError::SpendLimitExceeded))
         );
         assert_eq!(token.balance(&user), 1_000, "no tokens should move on a rejected send");
@@ -3418,7 +3581,7 @@ mod tests {
     // for any real SAC, since token_id is caller-supplied and unconstrained
     // beyond the allowlist check. Its `transfer` implementation, instead of
     // moving any value, immediately tries to call back into
-    // `GlobeWallet::record_spend` for the same (victim, asset_code) pair —
+    // `GlobeWallet::record_spend` for the same (victim, asset) pair —
     // the exact double-count scenario issue #92 describes. If Soroban's
     // reentry protection did not hold for this 3-hop chain, that call would
     // succeed and the assertions below would catch the resulting
@@ -3429,10 +3592,10 @@ mod tests {
 
     #[contractimpl]
     impl MaliciousToken {
-        pub fn init(env: Env, wallet_id: Address, victim: Address, asset_code: String) {
+        pub fn init(env: Env, wallet_id: Address, victim: Address, asset: AssetInfo) {
             env.storage().instance().set(&Symbol::new(&env, "wallet"), &wallet_id);
             env.storage().instance().set(&Symbol::new(&env, "victim"), &victim);
-            env.storage().instance().set(&Symbol::new(&env, "code"), &asset_code);
+            env.storage().instance().set(&Symbol::new(&env, "asset"), &asset);
         }
 
         /// Matches the standard token interface's `transfer` signature so
@@ -3440,16 +3603,16 @@ mod tests {
         pub fn transfer(env: Env, _from: Address, _to: Address, amount: i128) {
             let wallet_id: Address = env.storage().instance().get(&Symbol::new(&env, "wallet")).unwrap();
             let victim: Address = env.storage().instance().get(&Symbol::new(&env, "victim")).unwrap();
-            let code: String = env.storage().instance().get(&Symbol::new(&env, "code")).unwrap();
+            let asset: AssetInfo = env.storage().instance().get(&Symbol::new(&env, "asset")).unwrap();
             // Attempt the exact reentrant callback issue #92 describes: a
-            // second record_spend for the same (victim, asset_code) pair,
+            // second record_spend for the same (victim, asset) pair,
             // from inside the token's own transfer, before the outer
             // send/transfer_from call chain has unwound. Per
             // docs/design/wiring-reentrancy-threat-model.md §3.1, the host
             // must reject this because GlobeWallet's frame (the root of this
             // whole call chain) is still active on the stack.
             let victim_client = GlobeWalletClient::new(&env, &wallet_id);
-            victim_client.record_spend(&victim, &code, &amount);
+            victim_client.record_spend(&victim, &asset, &amount);
             // If we ever get here, the reentrant call above did NOT panic —
             // i.e. reentry protection failed to hold. Nothing further to do;
             // the test asserts on the resulting DailySpent state instead of
@@ -3467,14 +3630,15 @@ mod tests {
 
         let user = Address::generate(&env);
         let to = Address::generate(&env);
-        let code = String::from_str(&env, "XLM");
+        let asset = xlm(&env);
+        client.add_asset(&user, &asset);
 
         let evil_id = env.register_contract(None, MaliciousToken);
         let evil_client = MaliciousTokenClient::new(&env, &evil_id);
-        evil_client.init(&wallet_id, &user, &code);
+        evil_client.init(&wallet_id, &user, &asset);
 
         client.add_allowed_token(&admin, &evil_id);
-        client.set_spend_limit(&user, &code, &1_000_000_i128);
+        client.set_spend_limit(&user, &asset, &1_000_000_i128);
 
         env.ledger().with_mut(|l| l.sequence_number = 100);
         wrapper_client.approve(&user, &wallet_id, &1_000, &10_000);
@@ -3482,7 +3646,7 @@ mod tests {
         // The reentrant callback inside MaliciousToken::transfer must be
         // rejected by the host, which must fail transfer_from's call into
         // it, which must fail send() as a whole — never a silent success.
-        let result = client.try_send(&user, &evil_id, &code, &to, &100);
+        let result = client.try_send(&user, &evil_id, &asset, &to, &100);
         assert!(
             result.is_err(),
             "send() must fail when the token contract attempts to re-enter GlobeWallet, not silently succeed"
@@ -3494,7 +3658,7 @@ mod tests {
         // must be no DailySpent entry at all, proving neither the intended
         // spend nor a reentrant double-spend was left committed.
         env.as_contract(&wallet_id, || {
-            let key = DataKey::DailySpent(user.clone(), code.clone());
+            let key = DataKey::DailySpent(user.clone(), asset.clone());
             let record: Option<SpendRecord> = env.storage().persistent().get(&key);
             assert!(
                 record.is_none(),
@@ -3506,6 +3670,160 @@ mod tests {
         // The spend limit configuration itself (untouched by this call
         // either way) confirms setup was correct and we're not passing
         // vacuously because the limit was never configured.
-        assert_eq!(client.get_spend_limit(&user, &code), 1_000_000);
+        assert_eq!(client.get_spend_limit(&user, &asset), 1_000_000);
+    }
+
+    // ── Issue #82: Same-Code Different-Issuer Disambiguation & Acceptance Tests ──
+
+    #[test]
+    fn test_same_code_different_issuer_independent_spend_limits() {
+        let (env, _cid, _admin, client) = setup();
+        let user = Address::generate(&env);
+
+        let issuer_a = Address::generate(&env);
+        let issuer_b = Address::generate(&env);
+
+        let asset_a = AssetInfo {
+            code: String::from_str(&env, "USDC"),
+            issuer: Some(issuer_a),
+        };
+        let asset_b = AssetInfo {
+            code: String::from_str(&env, "USDC"),
+            issuer: Some(issuer_b),
+        };
+
+        client.add_asset(&user, &asset_a);
+        client.add_asset(&user, &asset_b);
+
+        client.set_spend_limit(&user, &asset_a, &500_i128);
+        client.set_spend_limit(&user, &asset_b, &1_000_i128);
+
+        assert_eq!(client.get_spend_limit(&user, &asset_a), 500);
+        assert_eq!(client.get_spend_limit(&user, &asset_b), 1_000);
+
+        // Spend against asset_a budget
+        client.record_spend(&user, &asset_a, &400_i128);
+        // Spend against asset_b budget
+        client.record_spend(&user, &asset_b, &800_i128);
+
+        // asset_a: 400 + 200 > 500 -> fails
+        assert_eq!(
+            client.try_record_spend(&user, &asset_a, &200_i128),
+            Err(Ok(WalletError::SpendLimitExceeded))
+        );
+
+        // asset_b: 800 + 200 <= 1000 -> succeeds independently
+        client.record_spend(&user, &asset_b, &200_i128);
+
+        // asset_b: now full -> further spend fails
+        assert_eq!(
+            client.try_record_spend(&user, &asset_b, &1_i128),
+            Err(Ok(WalletError::SpendLimitExceeded))
+        );
+    }
+
+    #[test]
+    fn test_spend_limit_and_record_spend_reject_unregistered_asset() {
+        let (env, _cid, _admin, client) = setup();
+        let user = Address::generate(&env);
+
+        let unregistered = AssetInfo {
+            code: String::from_str(&env, "EURC"),
+            issuer: Some(Address::generate(&env)),
+        };
+
+        // Rejects setting spend limit on unregistered asset
+        assert_eq!(
+            client.try_set_spend_limit(&user, &unregistered, &1_000_i128),
+            Err(Ok(WalletError::AssetNotFound))
+        );
+
+        // Rejects recording spend on unregistered asset
+        assert_eq!(
+            client.try_record_spend(&user, &unregistered, &100_i128),
+            Err(Ok(WalletError::AssetNotFound))
+        );
+
+        // get_spend_limit returns 0 for unregistered asset
+        assert_eq!(client.get_spend_limit(&user, &unregistered), 0);
+    }
+
+    #[test]
+    fn test_case_variant_asset_shares_same_spend_limit_bucket() {
+        let (env, _cid, _admin, client) = setup();
+        let user = Address::generate(&env);
+        let usdc_canonical = usdc(&env);
+        client.add_asset(&user, &usdc_canonical);
+
+        let usdc_lowercase = AssetInfo {
+            code: String::from_str(&env, "usdc"),
+            issuer: usdc_canonical.issuer.clone(),
+        };
+
+        // Setting limit using lowercase variant sets limit for canonical asset
+        client.set_spend_limit(&user, &usdc_lowercase, &1_000_i128);
+        assert_eq!(client.get_spend_limit(&user, &usdc_canonical), 1_000);
+        assert_eq!(client.get_spend_limit(&user, &usdc_lowercase), 1_000);
+
+        // Spend via canonical
+        client.record_spend(&user, &usdc_canonical, &600_i128);
+
+        // Spend via lowercase variant accumulates in the same bucket
+        client.record_spend(&user, &usdc_lowercase, &400_i128);
+
+        // Next unit fails on either
+        assert_eq!(
+            client.try_record_spend(&user, &usdc_canonical, &1_i128),
+            Err(Ok(WalletError::SpendLimitExceeded))
+        );
+        assert_eq!(
+            client.try_record_spend(&user, &usdc_lowercase, &1_i128),
+            Err(Ok(WalletError::SpendLimitExceeded))
+        );
+    }
+
+    #[test]
+    fn test_migrate_spend_limits_and_legacy_fallback() {
+        let (env, cid, _admin, client) = setup();
+        let user = Address::generate(&env);
+        let xlm_asset = xlm(&env);
+        let usdc_asset = usdc(&env);
+        client.add_asset(&user, &xlm_asset);
+        client.add_asset(&user, &usdc_asset);
+
+        // Write legacy entries directly to persistent storage under old (Symbol, Address, String) keys
+        let legacy_xlm_spend_key = (Symbol::new(&env, "SpendLimit"), user.clone(), String::from_str(&env, "XLM"));
+        let legacy_xlm_daily_key = (Symbol::new(&env, "DailySpent"), user.clone(), String::from_str(&env, "XLM"));
+        let legacy_usdc_spend_key = (Symbol::new(&env, "SpendLimit"), user.clone(), String::from_str(&env, "USDC"));
+
+        env.as_contract(&cid, || {
+            env.storage().persistent().set(&legacy_xlm_spend_key, &500_i128);
+            env.storage().persistent().set(&legacy_xlm_daily_key, &SpendRecord { amount: 200, day: 0 });
+            env.storage().persistent().set(&legacy_usdc_spend_key, &2_000_i128);
+        });
+
+        // Lazy fallback: get_spend_limit reads legacy key before migration
+        assert_eq!(client.get_spend_limit(&user, &xlm_asset), 500);
+        assert_eq!(client.get_spend_limit(&user, &usdc_asset), 2_000);
+
+        // Explicit migration runs and migrates both assets
+        let migrated_count = client.migrate_spend_limits(&user);
+        assert_eq!(migrated_count, 2);
+
+        // Verify storage keys were converted to DataKey::SpendLimit(user, AssetInfo)
+        env.as_contract(&cid, || {
+            assert!(env.storage().persistent().has(&DataKey::SpendLimit(user.clone(), xlm_asset.clone())));
+            assert!(env.storage().persistent().has(&DataKey::SpendLimit(user.clone(), usdc_asset.clone())));
+            assert!(!env.storage().persistent().has(&legacy_xlm_spend_key));
+            assert!(!env.storage().persistent().has(&legacy_xlm_daily_key));
+            assert!(!env.storage().persistent().has(&legacy_usdc_spend_key));
+        });
+
+        // Spending respects migrated records: XLM already spent 200 of 500 limit
+        client.record_spend(&user, &xlm_asset, &300_i128);
+        assert_eq!(
+            client.try_record_spend(&user, &xlm_asset, &1_i128),
+            Err(Ok(WalletError::SpendLimitExceeded))
+        );
     }
 }
