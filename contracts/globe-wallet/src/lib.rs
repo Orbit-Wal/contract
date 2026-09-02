@@ -1133,6 +1133,14 @@ impl GlobeWallet {
         env.storage()
             .persistent()
             .set(&DataKey::UserAssets(user.clone()), &new_assets);
+        // Clean up the per-asset spend-limit state so re-adding the asset later
+        // starts fresh and persistent storage does not grow unbounded.
+        env.storage()
+            .persistent()
+            .remove(&DataKey::SpendLimit(user.clone(), asset_code.clone()));
+        env.storage()
+            .persistent()
+            .remove(&DataKey::DailySpent(user.clone(), asset_code.clone()));
         env.storage().persistent().extend_ttl(
             &DataKey::UserAssets(user.clone()),
             PERSISTENT_TTL_THRESHOLD,
@@ -1773,6 +1781,38 @@ mod tests {
         let assets = client.get_assets(&user);
         assert_eq!(assets.len(), 1);
         assert_eq!(assets.get(0).unwrap().code, String::from_str(&env, "USDC"));
+    }
+
+    #[test]
+    fn test_remove_asset_clears_spend_limit_and_daily_spent() {
+        let (env, _cid, _admin, client) = setup();
+        let user = Address::generate(&env);
+        let code = String::from_str(&env, "USDC");
+        client.add_asset(&user, &usdc(&env));
+        client.set_spend_limit(&user, &code, &500_i128);
+        client.record_spend(&user, &code, &200_i128);
+        client.remove_asset(&user, &code);
+        assert_eq!(client.get_assets(&user).len(), 0);
+        // Spend limit should reset to default (0 = unlimited).
+        assert_eq!(client.get_spend_limit(&user, &code), 0);
+        // Re-adding the same asset should start with a fresh, unconfigured limit.
+        client.add_asset(&user, &usdc(&env));
+        assert_eq!(client.get_spend_limit(&user, &code), 0);
+    }
+
+    #[test]
+    fn test_remove_asset_keeps_other_asset_limits_intact() {
+        let (env, _cid, _admin, client) = setup();
+        let user = Address::generate(&env);
+        let usdc_code = String::from_str(&env, "USDC");
+        let xlm_code = String::from_str(&env, "XLM");
+        client.add_asset(&user, &usdc(&env));
+        client.add_asset(&user, &xlm(&env));
+        client.set_spend_limit(&user, &usdc_code, &500_i128);
+        client.set_spend_limit(&user, &xlm_code, &1_000_i128);
+        client.remove_asset(&user, &usdc_code);
+        assert_eq!(client.get_spend_limit(&user, &usdc_code), 0);
+        assert_eq!(client.get_spend_limit(&user, &xlm_code), 1_000);
     }
 
     #[test]
