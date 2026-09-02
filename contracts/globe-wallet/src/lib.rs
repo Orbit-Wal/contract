@@ -644,6 +644,16 @@ impl GlobeWallet {
                 return Err(WalletError::NotEnoughGuardians);
             }
         }
+        // Enforce the same minimum-guardian floor that set_recovery_config
+        // requires when recovery is configured. Without this, repeated removals
+        // can drift a configured wallet below MIN_GUARDIANS_FOR_RECOVERY.
+        if let Some(config) = &recovery_config {
+            if new_guardians.len() < config.threshold
+                || new_guardians.len() < Self::MIN_GUARDIANS_FOR_RECOVERY
+            {
+                return Err(WalletError::NotEnoughGuardians);
+            }
+        }
         env.storage()
             .instance()
             .set(&DataKey::Guardians, &new_guardians);
@@ -2506,6 +2516,40 @@ mod tests {
     }
 
     #[test]
+    fn test_remove_guardian_degrades_below_min_guardians_for_recovery_fails() {
+        // Issue #90: removing a guardian while recovery is configured must
+        // keep the guardian count at or above MIN_GUARDIANS_FOR_RECOVERY.
+        let (_env, admin, guardians, client) = setup_with_guardians(3);
+        client.set_recovery_config(&admin, &2u32, &GlobeWallet::MIN_RECOVERY_DELAY_LEDGERS);
+        assert_eq!(
+            client.try_remove_guardian(&admin, &guardians.get(0).unwrap()),
+            Err(Ok(WalletError::NotEnoughGuardians))
+        );
+        assert_eq!(client.guardians().len(), 3);
+    }
+
+    #[test]
+    fn test_remove_guardian_down_to_min_guardians_for_recovery_succeeds() {
+        // Boundary: removal that lands exactly on MIN_GUARDIANS_FOR_RECOVERY
+        // should still succeed when recovery is configured.
+        let (_env, admin, guardians, client) = setup_with_guardians(4);
+        client.set_recovery_config(&admin, &2u32, &GlobeWallet::MIN_RECOVERY_DELAY_LEDGERS);
+        client.remove_guardian(&admin, &guardians.get(0).unwrap());
+        assert_eq!(client.guardians().len(), 3);
+    }
+
+    #[test]
+    fn test_remove_guardian_without_recovery_not_bound_by_min_guardians() {
+        // When recovery is not configured, the MIN_GUARDIANS_FOR_RECOVERY
+        // floor does not apply; only the threshold check inside recovery_config
+        // would block removal, and here there is no config.
+        let (_env, admin, guardians, client) = setup_with_guardians(3);
+        client.remove_guardian(&admin, &guardians.get(0).unwrap());
+        client.remove_guardian(&admin, &guardians.get(1).unwrap());
+        assert_eq!(client.guardians().len(), 1);
+    }
+
+    #[test]
     fn test_removed_guardian_cannot_initiate_recovery() {
         let (env, admin, guardians, client) = setup_with_guardians(4);
         client.set_recovery_config(&admin, &2u32, &GlobeWallet::MIN_RECOVERY_DELAY_LEDGERS);
@@ -2524,7 +2568,8 @@ mod tests {
         // guardian who already approved a pending recovery must invalidate
         // that approval, not just block them from casting *new* ones (that
         // half is already covered by `test_removed_guardian_cannot_initiate_recovery`).
-        let (env, admin, guardians, client) = setup_with_guardians(3);
+        // Use 4 guardians so removing one still leaves >= MIN_GUARDIANS_FOR_RECOVERY.
+        let (env, admin, guardians, client) = setup_with_guardians(4);
         client.set_recovery_config(&admin, &2u32, &GlobeWallet::MIN_RECOVERY_DELAY_LEDGERS);
         let new_admin = Address::generate(&env);
 
@@ -2534,8 +2579,8 @@ mod tests {
 
         // Admin distrusts G1 (e.g. suspects key compromise colluding on this
         // very recovery) and removes them. 2 guardians remain (G0, G2)
-        // against threshold 2 — the NotEnoughGuardians guard passes fine,
-        // so removal itself succeeds.
+        // against threshold 2 — removal succeeds because 3 remain and that
+        // is still >= MIN_GUARDIANS_FOR_RECOVERY.
         client.remove_guardian(&admin, &guardians.get(1).unwrap());
 
         let proposal = client.recovery_proposal().unwrap();
@@ -2587,7 +2632,8 @@ mod tests {
         // After a removal de-quorates a proposal, the remaining guardians
         // must still be able to bring it back to quorum — with a *new*
         // ready_at, not a resurrected stale one.
-        let (env, admin, guardians, client) = setup_with_guardians(3);
+        // Use 4 guardians so removing one still leaves >= MIN_GUARDIANS_FOR_RECOVERY.
+        let (env, admin, guardians, client) = setup_with_guardians(4);
         client.set_recovery_config(&admin, &2u32, &GlobeWallet::MIN_RECOVERY_DELAY_LEDGERS);
         let new_admin = Address::generate(&env);
 
@@ -2598,7 +2644,7 @@ mod tests {
 
         env.ledger().with_mut(|l| l.sequence_number += 5);
         // G2 (never removed) approves, re-reaching quorum (G0 + G2 = 2/2).
-        client.approve_recovery(&guardians.get(2).unwrap());
+        client.approve_recovery(&guardians.get(2).unwrap()); // G0 + G2 = 2/2
         let rearmed = client.recovery_proposal().unwrap().ready_at;
         assert!(rearmed.is_some());
 
